@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  Laravel 13 · PHP 8.3+ · MySQL 8 · Blade · Alpine.js · Tailwind CSS · PHPUnit
+  Laravel 13 · PHP 8.4+ · MySQL 8 · Blade · Alpine.js · Tailwind CSS · PHPUnit
 </p>
 
 <p align="center">
@@ -58,7 +58,7 @@ flowchart LR
 
 | Area | Choice |
 | --- | --- |
-| Backend | Laravel 13, PHP 8.3+, MySQL 8 |
+| Backend | Laravel 13, PHP 8.4+, MySQL 8 |
 | Frontend | Blade, Alpine.js, Tailwind CSS v4, Turbo |
 | AI | OpenAI, Gemini, or Ollama through a provider interface |
 | Data | Laravel queues, typed BI tables, NDJSON materialization |
@@ -68,7 +68,7 @@ flowchart LR
 
 ### Prerequisites
 
-- PHP 8.3 or newer
+- PHP 8.4 or newer
 - Composer
 - Node.js and npm
 - MySQL 8 for local development
