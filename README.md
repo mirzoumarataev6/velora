@@ -13,7 +13,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mirzoumarataev6/velora/actions/workflows/tests.yml"><img src="https://github.com/mirzoumarataev6/velora/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2563eb" alt="MIT License" /></a>
 </p>
 
@@ -22,6 +21,16 @@
 Velora helps a business configure AI sales agents that answer customers through Telegram, WhatsApp, Instagram, and Green API. The same workspace gives the team a CRM pipeline, project board, knowledge base, product catalog, and BI dashboards.
 
 The application is designed around tenant isolation: every customer-facing record belongs to a team, access is controlled by role-based permissions, and the active workspace never overrides the row-level authorization boundary.
+
+## Product at a glance
+
+| Surface | What it does |
+| --- | --- |
+| AI sales agents | Answers catalog and knowledge-base questions, qualifies intent, and captures leads. |
+| Channels | Connects Telegram, WhatsApp, Instagram Direct, and Green API to one agent workspace. |
+| CRM and projects | Turns conversations into customers, deals, tasks, pipelines, and accountable team work. |
+| Analytics | Imports structured data and gives each team self-service dashboards without sharing datasets. |
+| Team workspace | Separates tenant data and controls access through named roles and permissions. |
 
 ## What it includes
 
@@ -63,6 +72,13 @@ flowchart LR
 | AI | OpenAI, Gemini, or Ollama through a provider interface |
 | Data | Laravel queues, typed BI tables, NDJSON materialization |
 | Quality | PHPUnit, Laravel Pint, tenant-isolation and SQL-shape tests |
+
+## Engineering principles
+
+- **Data isolation first.** Tenant identity is stored on the records that are read, and authorization evaluates the resource’s own team.
+- **Safe by construction.** Live-database and BI queries use validated structures and bound values instead of accepting raw SQL.
+- **Responsive operations.** Customer replies and long-running imports use separate queue pools so a large file cannot block a conversation.
+- **Honest interfaces.** User-facing failures are classified and translated instead of exposing stack traces or silently losing information.
 
 ## Local setup
 
