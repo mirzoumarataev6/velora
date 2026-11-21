@@ -12,6 +12,11 @@
   Laravel 13 · PHP 8.3+ · MySQL 8 · Blade · Alpine.js · Tailwind CSS · PHPUnit
 </p>
 
+<p align="center">
+  <a href="https://github.com/mirzoumarataev6/velora/actions/workflows/tests.yml"><img src="https://github.com/mirzoumarataev6/velora/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2563eb" alt="MIT License" /></a>
+</p>
+
 ## Overview
 
 Velora helps a business configure AI sales agents that answer customers through Telegram, WhatsApp, Instagram, and Green API. The same workspace gives the team a CRM pipeline, project board, knowledge base, product catalog, and BI dashboards.
