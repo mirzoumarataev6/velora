@@ -1,0 +1,105 @@
+<?php
+
+return [
+    'index' => [
+        'title' => 'Leads — Velora Agents',
+        'heading' => 'Leads',
+        'subheading' => 'Orders and requests your assistants captured from customers.',
+        'all_agents' => 'All agents',
+        'chat_only' => 'chat only',
+        'chat_only_hint' => 'No phone number — the order was taken anyway; reach this customer in the chat',
+        'no_name' => 'Unnamed customer',
+        'items_label' => 'Wants',
+        'note_label' => 'Note',
+        'delete' => 'Delete lead',
+        'updated' => 'Lead updated.',
+        'deleted' => 'Lead deleted.',
+        'action_failed' => 'Something went wrong. Please try again.',
+        'network_error' => 'Network error. Please try again.',
+        'delete_confirm' => 'Delete this lead? This cannot be undone.',
+        'empty_title' => 'No leads yet',
+        'empty_description' => 'When a customer places an order or leaves their contact details, the assistant records it here.',
+        'empty_filtered_title' => 'Nothing found',
+        'empty_filtered_description' => 'Try a different search, status or agent.',
+        'search_placeholder' => 'Search by name, contact or order…',
+        'search_results' => 'Results for “:term”',
+        'search_clear' => 'Clear',
+    ],
+
+    'filters' => [
+        'all' => 'All',
+        'new' => 'New',
+        'awaiting_price_approval' => 'Price approval',
+        'in_progress' => 'In progress',
+        'done' => 'Done',
+    ],
+
+    'status' => [
+        'new' => 'New',
+        'in_progress' => 'In progress',
+        'done' => 'Done',
+    ],
+
+    'source' => [
+        'telegram' => 'Telegram',
+        'whatsapp' => 'WhatsApp',
+        'greenapi' => 'WhatsApp (Green API)',
+        'instagram' => 'Instagram',
+        'playground' => 'Playground',
+    ],
+
+    'bell' => [
+        'label' => 'Notifications',
+        'title' => 'New leads',
+        'mark_seen' => 'Mark all read',
+        'empty' => 'No leads yet.',
+        'no_name' => 'Unnamed customer',
+        'view_all' => 'View all leads',
+    ],
+
+    'notify' => [
+        'heading' => 'Telegram alerts for new leads',
+        'description' => 'Link your personal Telegram to get a message the moment a new lead comes in.',
+        'telegram_required' => 'Connect a Telegram bot for this agent first (Channels tab), then you can link your Telegram here.',
+        'linked_as' => 'Alerts go to',
+        'unlink' => 'Unlink',
+        'link_button' => 'Link my Telegram',
+        'waiting' => 'Waiting for you to tap Start in Telegram…',
+        'open_telegram' => 'Open Telegram',
+        'unlink_confirm' => 'Stop sending lead alerts to this Telegram chat?',
+        'unlink_confirm_inline' => 'Unlink?',
+        'unlink_yes' => 'Yes',
+        'unlink_no' => 'No',
+        'toasts' => [
+            'linked' => 'Telegram linked — you will get alerts for new leads.',
+            'unlinked' => 'Telegram unlinked.',
+            'failed' => 'Something went wrong. Please try again.',
+            'network' => 'Network error. Please try again.',
+        ],
+    ],
+
+    'haggle' => [
+        'waiting_badge' => 'Awaiting you',
+        'requested_label' => 'Asking',
+        'listed_label' => 'Listed',
+        'settled_at' => 'Settled at :price',
+        'price_placeholder' => 'Price',
+        'approve' => 'Approve',
+        'decline' => 'Decline',
+        'approved' => 'Price approved — the customer has been told.',
+        'declined' => 'The decline has been sent to the customer.',
+        'approve_confirm' => 'Approve the price :price and reply to the customer?',
+        'decline_counter_confirm' => 'Decline the requested price and offer the customer :price instead?',
+        'invalid_price' => 'Enter a positive price or leave the field empty.',
+        'decline_confirm' => 'Decline this price? The customer gets a polite refusal. To offer a price of your own, type it in the box next to the buttons.',
+    ],
+
+    'views' => [
+        'orders' => 'Orders',
+        'haggle' => 'Haggling',
+        'empty_orders_title' => 'No leads yet',
+        'empty_orders_description' => 'When a customer places an order or asks to be contacted, it will show up here.',
+        'empty_haggle_title' => 'No price requests',
+        'empty_haggle_description' => 'When a customer asks for a price below your floor, the assistant negotiates and brings the request here for you to approve or decline.',
+    ],
+];

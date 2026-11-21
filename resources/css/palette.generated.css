@@ -1,0 +1,237 @@
+/*
+ * GENERATED FILE — DO NOT EDIT.
+ *
+ * Written by scripts/build-palette.mjs from tailwind.config.js, which is the
+ * single place any design token in this product is authored — colour, type
+ * scale, radii, elevation and motion. Editing this file will work until the
+ * next `npm run build`, and then silently revert.
+ *
+ * To change a token: edit tailwind.config.js and run `npm run palette`
+ * (or just `npm run build`, which does it for you).
+ */
+
+@theme {
+    --color-azure-50: #eff5ff;
+    --color-azure-100: #e6f1fc;
+    --color-azure-200: #d8e6f8;
+    --color-azure-300: #aecbf5;
+    --color-azure-400: #7aa5ff;
+    --color-azure-500: #1a50fc;
+    --color-azure-600: #0052cc;
+    --color-azure-700: #00429f;
+    --color-azure-800: #003480;
+    --color-azure-900: #002862;
+    --color-azure-950: #001536;
+
+    --color-slate-0: #ffffff;
+    --color-slate-50: #f3f6fb;
+    --color-slate-100: #e8ebf1;
+    --color-slate-200: #dde2ea;
+    --color-slate-300: #cbd2dd;
+    --color-slate-400: #b9c0cc;
+    --color-slate-500: #7d8592;
+    --color-slate-600: #5c6470;
+    --color-slate-700: #3a4150;
+    --color-slate-800: #232935;
+    --color-slate-900: #0f1115;
+    --color-slate-950: #080a0e;
+
+    --color-series-1: #0052cc;
+    --color-series-2: #c97608;
+    --color-series-3: #8a3ffc;
+    --color-series-4: #19a37a;
+    --color-series-5: #c4007b;
+    --color-series-6: #8a8400;
+
+    --color-series-dark-1: #4a86e0;
+    --color-series-dark-2: #b8862a;
+    --color-series-dark-3: #8a63cc;
+    --color-series-dark-4: #1d8a60;
+    --color-series-dark-5: #e35f9c;
+    --color-series-dark-6: #94912c;
+
+    --color-series-other: #b9c0cc;
+    --color-series-other-dark: #5c6470;
+    --color-brand: #1a50fc;
+    --color-brand-ring: #0052cc;
+    --color-brand-hover: #00429f;
+    --color-brand-strong: #0052cc;
+    --color-brand-deep: #00429f;
+    --color-brand-light: #7aa5ff;
+    --color-brand-tint: #d8e6f8;
+    --color-brand-circle: #e6f1fc;
+    --color-brand-band: #2f66c4;
+    --color-grad-from: #1a50fc;
+    --color-grad-via: #0052cc;
+    --color-grad-to: #00429f;
+    --color-on-accent: #ffffff;
+    --color-logo-from: #62a9fc;
+    --color-logo-to: #01014e;
+    --color-surface: #ffffff;
+    --color-paper: #f3f6fb;
+    --color-sunk: #e8ebf1;
+    --color-hairline: #dde2ea;
+    --color-hairline-strong: #cbd2dd;
+    --color-ink: #0f1115;
+    --color-ink-soft: #3a4150;
+    --color-muted: #5c6470;
+    --color-faint: #7d8592;
+    --color-night: #0d1117;
+    --color-night-soft: #111823;
+    --color-night-card: #151b26;
+    --color-night-raised: #1d2433;
+    --color-night-ink: #e8ecf5;
+    --color-night-muted: #9aa6bd;
+    --color-field-dark: #121926;
+    --color-success: #0e7a4a;
+    --color-success-light: #57cf94;
+    --color-danger: #c2183a;
+    --color-danger-deep: #a01230;
+    --color-danger-light: #f2899a;
+    --color-warning: #96620a;
+    --color-warning-light: #f0b429;
+    --color-info: #0e6f8b;
+    --color-info-light: #63c5e0;
+    --color-cream-50: #ffffff;
+    --color-cream-100: #f3f6fb;
+    --color-cream-200: #f3f6fb;
+    --color-cream-300: #e8ebf1;
+    --color-cream-400: #dde2ea;
+    --color-cream-500: #cbd2dd;
+
+    --color-charcoal-50: #e8ecf5;
+    --color-charcoal-100: #dde2ea;
+    --color-charcoal-300: #9aa6bd;
+    --color-charcoal-500: #5c6470;
+    --color-charcoal-700: #1d2433;
+    --color-charcoal-800: #111823;
+    --color-charcoal-900: #0f1115;
+    --color-charcoal-950: #0d1117;
+
+    --color-sand-0: #ffffff;
+    --color-sand-50: #f3f6fb;
+    --color-sand-100: #e8ebf1;
+    --color-sand-200: #dde2ea;
+    --color-sand-300: #cbd2dd;
+    --color-sand-400: #b9c0cc;
+    --color-sand-500: #7d8592;
+    --color-sand-600: #5c6470;
+    --color-sand-700: #3a4150;
+    --color-sand-800: #232935;
+    --color-sand-900: #0f1115;
+    --color-sand-950: #080a0e;
+
+    --color-ember-50: #eff5ff;
+    --color-ember-100: #e6f1fc;
+    --color-ember-200: #d8e6f8;
+    --color-ember-300: #aecbf5;
+    --color-ember-400: #7aa5ff;
+    --color-ember-500: #1a50fc;
+    --color-ember-600: #0052cc;
+    --color-ember-700: #00429f;
+    --color-ember-800: #003480;
+    --color-ember-900: #002862;
+    --color-ember-950: #001536;
+
+    --color-orange-50: #eff5ff;
+    --color-orange-100: #e6f1fc;
+    --color-orange-200: #d8e6f8;
+    --color-orange-300: #aecbf5;
+    --color-orange-400: #7aa5ff;
+    --color-orange-500: #1a50fc;
+    --color-orange-600: #0052cc;
+    --color-orange-700: #00429f;
+    --color-orange-800: #003480;
+    --color-orange-900: #002862;
+    --color-orange-950: #001536;
+
+    --font-sans: Onest, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji';
+    --font-serif: Onest, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+    --font-display: Onest, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+
+    --text-overline: 0.6875rem;
+    --text-overline--line-height: 1;
+    --text-overline--letter-spacing: 0.06em;
+    --text-overline--font-weight: 500;
+    --text-caption: 0.75rem;
+    --text-caption--line-height: 1.45;
+    --text-caption--letter-spacing: 0;
+    --text-body-sm: 0.8125rem;
+    --text-body-sm--line-height: 1.55;
+    --text-body-sm--letter-spacing: 0;
+    --text-body: 0.9375rem;
+    --text-body--line-height: 1.6;
+    --text-body--letter-spacing: -0.005em;
+    --text-body-lg: 1.0625rem;
+    --text-body-lg--line-height: 1.6;
+    --text-body-lg--letter-spacing: -0.01em;
+    --text-lead: clamp(1.0625rem, 0.95rem + 0.5vw, 1.1875rem);
+    --text-lead--line-height: 1.55;
+    --text-lead--letter-spacing: -0.011em;
+    --text-lead--font-weight: 400;
+    --text-h4: 1.125rem;
+    --text-h4--line-height: 1.35;
+    --text-h4--letter-spacing: -0.014em;
+    --text-h4--font-weight: 600;
+    --text-h3: clamp(1.375rem, 1.25rem + 0.45vw, 1.625rem);
+    --text-h3--line-height: 1.28;
+    --text-h3--letter-spacing: -0.018em;
+    --text-h3--font-weight: 600;
+    --text-h2: clamp(1.5rem, 1.25rem + 1.1vw, 2rem);
+    --text-h2--line-height: 1.24;
+    --text-h2--letter-spacing: -0.02em;
+    --text-h2--font-weight: 600;
+    --text-h1: clamp(1.875rem, 1.4rem + 1.9vw, 2.625rem);
+    --text-h1--line-height: 1.16;
+    --text-h1--letter-spacing: -0.022em;
+    --text-h1--font-weight: 600;
+    --text-kpi: clamp(1.5rem, 1.3rem + 0.6vw, 1.75rem);
+    --text-kpi--line-height: 1.1;
+    --text-kpi--letter-spacing: -0.02em;
+    --text-kpi--font-weight: 600;
+    --text-kpi-lg: clamp(1.75rem, 1.45rem + 1vw, 2.25rem);
+    --text-kpi-lg--line-height: 1.08;
+    --text-kpi-lg--letter-spacing: -0.022em;
+    --text-kpi-lg--font-weight: 600;
+    --text-display-sm: clamp(1.75rem, 1.45rem + 1vw, 2.25rem);
+    --text-display-sm--line-height: 1.08;
+    --text-display-sm--letter-spacing: -0.022em;
+    --text-display-sm--font-weight: 600;
+    --text-display: clamp(1.875rem, 1.4rem + 1.9vw, 2.625rem);
+    --text-display--line-height: 1.16;
+    --text-display--letter-spacing: -0.022em;
+    --text-display--font-weight: 600;
+    --text-display-lg: clamp(2rem, 1.4rem + 2.4vw, 3rem);
+    --text-display-lg--line-height: 1.12;
+    --text-display-lg--letter-spacing: -0.024em;
+    --text-display-lg--font-weight: 600;
+
+    --radius-xs: 0.5rem;
+    --radius-sm: 0.625rem;
+    --radius-md: 0.75rem;
+    --radius-lg: 0.875rem;
+    --radius-xl: 0.875rem;
+    --radius-2xl: 1rem;
+    --radius-3xl: 1.5rem;
+    --radius-4xl: 2rem;
+    --radius-pill: 999px;
+
+    --shadow-e1: 0 1px 2px rgba(15, 23, 41, 0.04), 0 4px 16px rgba(15, 23, 41, 0.04);
+    --shadow-e2: 0 2px 4px rgba(15, 23, 41, 0.05), 0 12px 28px rgba(15, 23, 41, 0.07);
+    --shadow-e3: 0 1px 2px rgba(15, 23, 41, 0.04), 0 12px 28px -12px rgba(15, 23, 41, 0.16);
+    --shadow-e4: 0 2px 4px rgba(15, 23, 41, 0.04), 0 24px 48px -24px rgba(15, 23, 41, 0.22);
+    --shadow-e5: 0 2px 8px rgba(15, 23, 41, 0.05), 0 40px 80px -32px rgba(15, 23, 41, 0.28);
+    --shadow-glow-ember: 0 8px 28px -10px rgba(26, 80, 252, 0.35);
+    --shadow-glow-ember-lg: 0 16px 40px -12px rgba(26, 80, 252, 0.45);
+    --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+
+    --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+    --ease-inout: cubic-bezier(0.65, 0, 0.35, 1);
+    --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+    --duration-instant: 90ms;
+    --duration-fast: 160ms;
+    --duration-base: 240ms;
+    --duration-slow: 380ms;
+    --duration-slower: 640ms;
+}

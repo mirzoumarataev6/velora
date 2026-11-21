@@ -1,0 +1,1761 @@
+<?php
+
+namespace App\Services;
+
+use App\Exceptions\LlmException;
+use App\Jobs\SendLeadNotificationJob;
+use App\Models\Agent;
+use App\Models\Conversation;
+use App\Models\Lead;
+use App\Models\Message;
+use App\Services\Dataset\ProductSearchService;
+use App\Services\Escalation\HostilityDetector;
+use App\Services\Haggling\HagglingService;
+use App\Services\Leads\OrderConfirmationGuard;
+use App\Services\Llm\LlmProviderInterface;
+use App\Services\Llm\UsageRecorder;
+use App\Services\Quality\NonAnswerDetector;
+use App\Services\Rag\ProductQuestionDetector;
+use App\Services\Rag\RetrievedChunk;
+use App\Services\Rag\VectorStoreInterface;
+use App\Services\Reply\CustomerLocale;
+use App\Services\Reply\FollowUpDetector;
+use App\Services\Reply\LanguageDetector;
+use App\Services\Reply\ReplySimilarity;
+use App\Services\Reply\ReplyStyleCleaner;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Log;
+use Throwable;
+
+class AgentReplyService
+{
+    protected const LANGUAGE_NAMES = [
+        'ru' => 'Russian',
+        'en' => 'English',
+        'tj' => 'Tajik',
+        'uz' => 'Uzbek',
+    ];
+
+    protected const FALLBACK_SUPPRESSION_MINUTES = 5;
+
+    protected const GREETING_PATTERN = '/^\s*(привет\w*|здравствуй\w*|добр(ый|ое)\s+(день|вечер|утро)|hi|hello+|hey+|salom\w*|ассалому\s*алейкум|салом\w*|assalomu\s*alaykum)[\s!.,?]*$/iu';
+
+    protected const MAX_PRODUCT_SEARCH_ROUNDS = 2;
+
+    protected const OUTPUT_CHARS_PER_TOKEN = 1.0;
+
+    protected const OUTPUT_TOKEN_HEADROOM = 1.25;
+
+    protected const MAX_OUTPUT_TOKENS = 4000;
+
+    protected const REPEATED_QUESTION_LOOKBACK = 6;
+
+    protected const LANGUAGE_LOOKBACK = 5;
+
+    protected const ORDER_CLAIM_WINDOW_MINUTES = 10;
+
+    protected const REPEAT_LOOKBACK = 3;
+
+    protected const START_COMMAND_PATTERN = '/^\/start(?:@\S+)?(?:\s.*)?$/su';
+
+    public function __construct(
+        protected LlmProviderInterface $llm,
+        protected VectorStoreInterface $vectorStore,
+        protected UsageRecorder $usage,
+        protected LeadCaptureService $leadCapture,
+        protected EscalationService $escalation,
+        protected ProductSearchService $productSearch,
+        protected ProductQuestionDetector $productQuestions,
+        protected FollowUpDetector $followUps,
+        protected LanguageDetector $languages,
+        protected ReplySimilarity $similarity,
+        protected HostilityDetector $hostility,
+        protected OrderConfirmationGuard $orderClaims,
+        protected HagglingService $haggling,
+
+        protected NonAnswerDetector $nonAnswers = new NonAnswerDetector,
+        protected CustomerLocale $locales = new CustomerLocale,
+        protected ReplyStyleCleaner $styleCleaner = new ReplyStyleCleaner,
+    ) {}
+
+    public function shouldSuppressReply(Conversation $conversation): bool
+    {
+        $lastAssistant = $conversation->messages()
+            ->where('role', 'assistant')
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->first();
+
+        if (! $lastAssistant || ! ($lastAssistant->meta['failed'] ?? false)) {
+            return false;
+        }
+
+        return $lastAssistant->created_at->gt(now()->subMinutes(self::FALLBACK_SUPPRESSION_MINUTES));
+    }
+
+    public function reply(
+        Conversation $conversation,
+        string $userMessage,
+        ?string $externalMessageId = null,
+        string $sourceType = 'text',
+        ?int $voiceDuration = null,
+    ): array {
+        $userMsg = $conversation->messages()->create([
+            'role' => 'user',
+            'content' => $userMessage,
+            'external_message_id' => $externalMessageId,
+
+            'source_type' => $sourceType,
+            'voice_duration' => $voiceDuration,
+        ]);
+
+        return ['user' => $userMsg, 'assistant' => $this->generateReplyFor($conversation, $userMsg)];
+    }
+
+    public function generateReplyFor(Conversation $conversation, Message $userMsg): Message
+    {
+        $agent = $conversation->agent;
+        $this->usage->for($agent);
+        $startedAt = microtime(true);
+
+        $retrieved = [];
+        $embeddingMs = 0.0;
+        $searchMs = 0.0;
+        $generationMs = 0.0;
+        $usage = ['input_tokens' => 0, 'output_tokens' => 0];
+        $failed = false;
+
+        $capturedLeads = [];
+
+        $haggleLeads = [];
+        $escalation = null;
+        $productSearches = 0;
+        $productQueries = [];
+        $productImageCandidates = [];
+        $productMisses = 0;
+        $retrievalSkipped = false;
+        $handover = null;
+        $askedForPhone = false;
+        $isFollowUp = false;
+        $rewroteRepeat = false;
+        $styleCleaned = false;
+
+        try {
+            $detectEscalation = $this->escalation->enabledFor($agent);
+            $searchProducts = $this->productSearch->enabledFor($agent);
+
+            $negotiatesPrice = $searchProducts && $this->haggling->enabledFor($agent);
+
+            $previousReply = $this->lastAssistantMessage($conversation, $userMsg);
+            $isFollowUp = $this->followUps->isShortFollowUp($userMsg->content, $previousReply !== null);
+
+            $handover = $detectEscalation ? $this->detectHandover($conversation, $userMsg) : null;
+
+            $retrievalSkipped = $searchProducts
+                && config('agent.rag.skip_for_product_questions')
+                && $this->productQuestions->isPureProductQuestion($userMsg->content);
+
+            if (! $retrievalSkipped) {
+                $embeddingStart = microtime(true);
+                $queryEmbedding = $this->llm->embed($userMsg->content);
+                $embeddingMs = (microtime(true) - $embeddingStart) * 1000;
+
+                $searchStart = microtime(true);
+                $retrieved = $this->vectorStore->search(
+                    $agent,
+                    $queryEmbedding['vector'],
+                    (int) config('agent.rag.top_k'),
+                    (float) config('agent.rag.similarity_threshold'),
+                    (float) config('agent.rag.relative_ratio'),
+                    (int) config('agent.rag.min_context_chunks'),
+                );
+                $searchMs = (microtime(true) - $searchStart) * 1000;
+            }
+
+            $systemPrompt = $this->buildSystemPrompt($agent, $retrieved, $conversation, $searchProducts, $retrievalSkipped);
+
+            if ($isFollowUp) {
+                $systemPrompt .= "\n\n".$this->followUpInstruction($previousReply?->content);
+            }
+
+            if ($handover !== null) {
+                $systemPrompt .= "\n\n".$this->handoverInstruction();
+            }
+            if ($searchProducts) {
+                $systemPrompt .= "\n\n".$this->productSearch->systemInstruction();
+            }
+
+            $systemPrompt .= "\n\n".$this->leadCapture->systemInstruction();
+            if ($negotiatesPrice) {
+                $systemPrompt .= "\n\n".$this->haggling->systemInstruction($agent);
+            }
+            if ($detectEscalation) {
+                $systemPrompt .= "\n\n".$this->escalation->systemInstruction($agent);
+            }
+
+            $systemPrompt .= "\n\n".$this->conversationStyleInstruction();
+            $contents = $this->buildContents($conversation);
+
+            Log::debug('agent.prompt', [
+                'agent_id' => $agent->id,
+                'conversation_id' => $conversation->id,
+                'system_prompt' => $systemPrompt,
+                'contents' => $contents,
+            ]);
+
+            $options = [
+                'max_output_tokens' => $this->maxOutputTokens($agent),
+                'temperature' => 0.4,
+
+                'thinking_budget' => 0,
+            ];
+
+            $tools = [];
+            if ($searchProducts) {
+                $tools[] = $this->productSearch->toolDefinition();
+            }
+            $tools[] = $this->leadCapture->toolDefinition();
+            if ($negotiatesPrice) {
+                $tools[] = $this->haggling->toolDefinition();
+            }
+            if ($detectEscalation) {
+                $tools[] = $this->escalation->toolDefinition();
+            }
+            if ($tools !== []) {
+                $options['tools'] = $tools;
+            }
+
+            $generationStart = microtime(true);
+            $result = $this->llm->generate($systemPrompt, $contents, $options);
+            $toolCalls = $result['tool_calls'] ?? [];
+            $carried = ['input_tokens' => 0, 'output_tokens' => 0];
+
+            if ($searchProducts) {
+                $resolved = $this->resolveProductSearches($agent, $systemPrompt, $contents, $result, $options);
+                $result = $resolved['result'];
+                $contents = $resolved['contents'];
+                $carried = $resolved['carried'];
+                $productSearches = $resolved['searches'];
+                $productQueries = $resolved['queries'];
+                $productImageCandidates = $resolved['images'];
+                $productMisses = $resolved['misses'];
+
+                $toolCalls = [...$resolved['tool_calls'], ...($result['tool_calls'] ?? [])];
+            }
+
+            if ($searchProducts && $retrievalSkipped && $productSearches === 0) {
+                Log::warning('Product question answered without calling '.ProductSearchService::TOOL_NAME, [
+                    'agent_id' => $agent->id,
+                    'conversation_id' => $conversation->id,
+                    'message' => $userMsg->content,
+                    'other_tool_calls' => array_values(array_filter(array_map(
+                        fn ($call) => $call['name'] ?? null,
+                        $toolCalls,
+                    ))),
+                ]);
+            }
+
+            if ($detectEscalation) {
+                $escalation = $this->firstEscalationCall($agent, $toolCalls);
+            }
+
+            if ($handover !== null) {
+                $escalation = [
+                    'signal' => $handover['signal'],
+                    'confidence' => 1.0,
+                    'summary' => $escalation['summary'] ?? $handover['summary'],
+                    'detected_by' => 'pipeline',
+                    'reason' => $handover['reason'],
+                ];
+            }
+
+            $leadCalls = array_values(array_filter(
+                $toolCalls,
+                fn ($call) => ($call['name'] ?? null) === LeadCaptureService::TOOL_NAME
+            ));
+
+            $haggleCalls = $negotiatesPrice
+                ? array_values(array_filter(
+                    $toolCalls,
+                    fn ($call) => ($call['name'] ?? null) === HagglingService::TOOL_NAME
+                ))
+                : [];
+
+            $haggleCalls = array_values(array_filter(
+                $haggleCalls,
+                fn ($call) => $this->haggling->isBelowFloor(
+                    $agent,
+                    $this->numeric($call['arguments']['requested_price'] ?? null),
+                    $this->numeric($call['arguments']['listed_price'] ?? null),
+                ),
+            ));
+
+            if ($haggleCalls !== []) {
+
+                $request = $this->requestPriceApproval($agent, $conversation, $contents, $systemPrompt, $result, $haggleCalls);
+                $replyText = $request['text'];
+                $usage = $request['usage'];
+                $haggleLeads = $request['leads'];
+            } elseif ($leadCalls !== [] && $this->leadCapture->shouldAskForPhoneFirst($conversation, $leadCalls)) {
+
+                $ask = $this->askForPhoneBeforeRecording($agent, $conversation, $contents, $systemPrompt, $result, $leadCalls);
+                $replyText = $ask['text'];
+                $usage = $ask['usage'];
+                $askedForPhone = true;
+            } elseif ($leadCalls !== []) {
+
+                $capture = $this->captureLeadsAndConfirm($agent, $conversation, $contents, $systemPrompt, $result, $leadCalls);
+                $replyText = $capture['text'];
+                $usage = $capture['usage'];
+                $capturedLeads = $capture['leads'];
+            } else {
+                $replyText = trim($result['text']) !== ''
+                    ? $result['text']
+
+                    : ($escalation !== null || $handover !== null
+                        ? $this->escalationAcknowledgement($agent)
+                        : $this->fallbackMessage($agent));
+                $usage = ['input_tokens' => $result['input_tokens'], 'output_tokens' => $result['output_tokens']];
+
+                $replyText = $this->repairTruncatedReply($replyText, $result['finish_reason'] ?? null);
+
+                $recentReplies = $this->recentAssistantReplies($conversation, $userMsg);
+
+                if ($recentReplies !== []) {
+                    $retry = $this->rewriteIfRepeated(
+                        $agent,
+                        $conversation,
+                        $systemPrompt,
+                        $contents,
+                        $replyText,
+                        $recentReplies,
+                        $options,
+                    );
+
+                    $replyText = $retry['text'];
+                    $usage['input_tokens'] += $retry['usage']['input_tokens'];
+                    $usage['output_tokens'] += $retry['usage']['output_tokens'];
+                    $rewroteRepeat = $retry['rewritten'];
+                }
+
+                $cleaned = $this->styleCleaner->clean($replyText);
+                $styleCleaned = $cleaned !== $replyText;
+                $replyText = $cleaned;
+            }
+
+            if ($haggleLeads === []) {
+                $replyText = $this->honourAnyOrderClaim($agent, $conversation, $replyText, $capturedLeads);
+            }
+            $replyText = $this->removeFalsePhotoRefusal($replyText, $userMsg->content);
+            $replyText = $this->removeFalsePhotoConfirmation($replyText);
+            $replyText = $this->rejectEmptyReply($agent, $conversation, $replyText);
+
+            $usage['input_tokens'] += $carried['input_tokens'];
+            $usage['output_tokens'] += $carried['output_tokens'];
+
+            $generationMs = (microtime(true) - $generationStart) * 1000;
+        } catch (LlmException $e) {
+            Log::warning('Agent reply generation failed, using fallback message', [
+                'agent_id' => $agent->id,
+                'conversation_id' => $conversation->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            $replyText = match (true) {
+
+                $handover !== null => $this->escalationAcknowledgement($agent),
+
+                $this->isSimpleGreeting($userMsg->content) => $this->greetingMessage($agent, $conversation),
+                default => $this->fallbackMessage($agent),
+            };
+
+            if ($handover !== null) {
+                $escalation = [
+                    'signal' => $handover['signal'],
+                    'confidence' => 1.0,
+                    'summary' => $handover['summary'],
+                    'detected_by' => 'pipeline',
+                    'reason' => $handover['reason'],
+                ];
+            }
+
+            $failed = true;
+        }
+
+        $totalMs = (microtime(true) - $startedAt) * 1000;
+
+        $unanswered = $this->classifyUnanswered(
+            failed: $failed,
+            productSearches: $productSearches,
+            productMisses: $productMisses,
+            retrieved: $retrieved,
+            retrievalSkipped: $retrievalSkipped,
+            capturedLeads: $capturedLeads,
+            userMessage: $userMsg->content,
+            replyText: $replyText,
+            escalated: $escalation !== null,
+            priceApprovalRequested: $haggleLeads !== [],
+        );
+
+        $assistantMsg = $conversation->messages()->create([
+            'role' => 'assistant',
+            'content' => $replyText,
+            'meta' => [
+                'retrieved_chunks' => array_map(fn ($r) => $r->toArray(), $retrieved),
+                'input_tokens' => $usage['input_tokens'],
+                'output_tokens' => $usage['output_tokens'],
+                'embedding_ms' => round($embeddingMs, 1),
+                'search_ms' => round($searchMs, 2),
+                'retrieval_ms' => round($embeddingMs + $searchMs, 1),
+
+                'retrieval_skipped' => $retrievalSkipped,
+                'generation_ms' => round($generationMs, 1),
+                'total_ms' => round($totalMs, 1),
+                'failed' => $failed,
+                'lead_captured' => $capturedLeads !== [],
+
+                LeadCaptureService::ASKED_FOR_PHONE => $askedForPhone,
+                'lead_ids' => array_map(fn (Lead $lead) => $lead->id, $capturedLeads),
+
+                'price_approval_requested' => $haggleLeads !== [],
+                'haggle_lead_ids' => array_map(fn (Lead $lead) => $lead->id, $haggleLeads),
+                'escalated' => $escalation !== null,
+                'escalation_signal' => $escalation['signal'] ?? null,
+                'escalation_confidence' => $escalation['confidence'] ?? null,
+
+                'product_searches' => $productSearches,
+
+                'product_queries' => $productQueries,
+                'product_image_candidates' => array_slice($productImageCandidates, 0, 10),
+
+                'unanswered' => $unanswered !== null,
+                'unanswered_reason' => $unanswered['reason'] ?? null,
+
+                'unanswered_detected_by' => $unanswered['detected_by'] ?? null,
+                'unanswered_question' => $unanswered === null ? null : mb_substr(trim($userMsg->content), 0, 300),
+
+                'escalation_detected_by' => $escalation['detected_by'] ?? ($escalation !== null ? 'model' : null),
+                'escalation_reason' => $escalation['reason'] ?? null,
+
+                'short_follow_up' => $isFollowUp,
+                'style_cleaned' => $styleCleaned,
+                'rewrote_repeated_reply' => $rewroteRepeat,
+            ],
+        ]);
+
+        $conversation->update(['last_message_at' => now()]);
+
+        foreach ([...$capturedLeads, ...$haggleLeads] as $lead) {
+            SendLeadNotificationJob::dispatch($lead);
+        }
+
+        if ($escalation !== null) {
+            $this->escalation->escalate($agent, $conversation, $escalation);
+        }
+
+        return $assistantMsg;
+    }
+
+    protected function classifyUnanswered(
+        bool $failed,
+        int $productSearches,
+        int $productMisses,
+        array $retrieved,
+        bool $retrievalSkipped,
+        array $capturedLeads,
+        string $userMessage,
+        string $replyText,
+        bool $escalated,
+        bool $priceApprovalRequested,
+    ): ?array {
+
+        if ($capturedLeads !== [] || $priceApprovalRequested) {
+            return null;
+        }
+
+        if ($failed) {
+            return ['reason' => 'provider_down', 'detected_by' => 'pipeline'];
+        }
+
+        if ($productSearches > 0) {
+            return $productMisses === $productSearches
+                ? ['reason' => 'catalog_miss', 'detected_by' => 'retrieval']
+                : null;
+        }
+
+        if ($retrievalSkipped || ! $this->looksLikeAQuestion($userMessage)) {
+            return null;
+        }
+
+        if (! $this->looksLikeANonAnswer($replyText)) {
+            return null;
+        }
+
+        if ($escalated) {
+            return null;
+        }
+
+        $confident = array_filter($retrieved, fn (RetrievedChunk $chunk) => $chunk->confident);
+
+        return [
+            'reason' => 'knowledge_miss',
+            'detected_by' => $confident === [] ? 'retrieval' : 'reply_text',
+        ];
+    }
+
+    protected function looksLikeANonAnswer(string $reply): bool
+    {
+        return $this->nonAnswers->matches($reply);
+    }
+
+    protected function looksLikeAQuestion(string $message): bool
+    {
+        $message = trim($message);
+
+        if ($message === '' || str_starts_with($message, '[')) {
+            return false;
+        }
+
+        return str_contains($message, '?')
+            || str_contains($message, '؟')
+            || count(preg_split('/\s+/u', $message, -1, PREG_SPLIT_NO_EMPTY) ?: []) >= 3;
+    }
+
+    protected function resolveProductSearches(
+        Agent $agent,
+        string $systemPrompt,
+        array $contents,
+        array $result,
+        array $options,
+    ): array {
+        $carried = ['input_tokens' => 0, 'output_tokens' => 0];
+        $seenToolCalls = [];
+        $searches = 0;
+
+        $queries = [];
+        $images = [];
+        $misses = 0;
+
+        for ($round = 0; $round < self::MAX_PRODUCT_SEARCH_ROUNDS; $round++) {
+            $calls = array_values(array_filter(
+                $result['tool_calls'] ?? [],
+                fn ($call) => ($call['name'] ?? null) === ProductSearchService::TOOL_NAME,
+            ));
+
+            if ($calls === []) {
+                break;
+            }
+
+            foreach ($calls as $call) {
+                $arguments = $call['arguments'] ?? [];
+                $found = $this->productSearch->search($agent, $arguments);
+                foreach ([...($found['products'] ?? []), ...($found['nearest'] ?? [])] as $product) {
+                    if (! empty($product['image_url'])) {
+                        $images[] = ['url' => $product['image_url'], 'name' => $product['name'] ?? ''];
+                    }
+                }
+                $searches++;
+
+                $queries[] = [
+
+                    'query' => $found['filters']['query'] ?? null,
+                    'category' => $found['filters']['category'] ?? null,
+                    'count' => (int) $found['count'],
+                ];
+
+                if ((int) $found['count'] === 0 && empty($found['nearest'])) {
+                    $misses++;
+                }
+
+                Log::info('agent.product_search', [
+                    'agent_id' => $agent->id,
+
+                    'arguments' => $arguments,
+                    'filters' => $found['filters'],
+                    'count' => $found['count'],
+                    'nearest' => count($found['nearest'] ?? []),
+                ]);
+
+                $contents[] = ['role' => 'tool_call', 'id' => $call['id'], 'name' => $call['name'], 'arguments' => $arguments];
+                $contents[] = [
+                    'role' => 'tool_result',
+                    'id' => $call['id'],
+                    'name' => $call['name'],
+                    'result' => json_encode($found, JSON_UNESCAPED_UNICODE),
+                ];
+            }
+
+            $seenToolCalls = [...$seenToolCalls, ...array_values(array_filter(
+                $result['tool_calls'] ?? [],
+                fn ($call) => ($call['name'] ?? null) !== ProductSearchService::TOOL_NAME,
+            ))];
+
+            $carried['input_tokens'] += (int) ($result['input_tokens'] ?? 0);
+            $carried['output_tokens'] += (int) ($result['output_tokens'] ?? 0);
+
+            $result = $this->llm->generate($systemPrompt, $contents, $options);
+        }
+
+        return [
+            'result' => $result,
+            'contents' => $contents,
+            'carried' => $carried,
+            'tool_calls' => $seenToolCalls,
+            'searches' => $searches,
+            'queries' => $queries,
+            'images' => array_slice(array_values(array_unique($images, SORT_REGULAR)), 0, 10),
+            'misses' => $misses,
+        ];
+    }
+
+    protected function removeFalsePhotoRefusal(string $replyText, string $customerText): string
+    {
+        if (preg_match('/(?:к сожалению,?\s*)?я не могу (?:отправить|прислать|показать)[^\n]*(?:фото|фотограф|картинк|изображен)/iu', $replyText) !== 1) {
+            return $replyText;
+        }
+
+        $cleaned = preg_replace('/(?:к сожалению,?\s*)?я не могу (?:отправить|прислать|показать)[^.!?\n]*(?:фото|фотограф|картинк|изображен)[^\n]*?(?:[.!?](?=\s|$)|$)/iu', '', $replyText);
+        $cleaned = preg_replace('/(?:однако\s+)?вы можете (?:увидеть|посмотреть)[^\n]*?сайт[^\n]*?(?:[.!?](?=\s|$)|$)/iu', '', $cleaned);
+        $cleaned = trim($this->styleCleaner->clean(trim($cleaned)));
+
+        return $cleaned !== '' ? $cleaned : 'Какую модель хотите посмотреть?';
+    }
+
+    protected function removeFalsePhotoConfirmation(string $replyText): string
+    {
+        $pattern = '/(?:вот\s+)?(?:фото|фотограф\w*|картинк\w*|изображен\w*)[^.!?\n]*?(?:отправлен\w*|прислал\w*|высла\w*|готов\w*)[^.!?\n]*?(?:[.!?](?=\s|$)|$)'
+            .'|(?:©[^\n]*?)?(?:cc\s*by[^\n]*|wikimedia[^\n]*|creative\s*commons[^\n]*)[^.!?\n]*?(?:[.!?](?=\s|$)|$)/iu';
+
+        if (preg_match($pattern, $replyText) !== 1) {
+            return $replyText;
+        }
+
+        $cleaned = trim($this->styleCleaner->clean(trim((string) preg_replace($pattern, '', $replyText))));
+
+        return $cleaned !== '' ? $cleaned : 'Уточняю фото для этой модели — одну минуту.';
+    }
+
+    protected function rejectEmptyReply(Agent $agent, Conversation $conversation, string $replyText): string
+    {
+        if (preg_match('/[\p{L}\p{N}]/u', $replyText)) {
+            return $replyText;
+        }
+
+        Log::warning('Model produced a reply with no content; sending the fallback instead', [
+            'agent_id' => $agent->id,
+            'conversation_id' => $conversation->id,
+            'reply' => $replyText,
+        ]);
+
+        return $this->fallbackMessage($agent);
+    }
+
+    protected function honourAnyOrderClaim(Agent $agent, Conversation $conversation, string $replyText, array &$capturedLeads): string
+    {
+        if (! $this->orderClaims->claimsOrderRecorded($replyText)) {
+            return $replyText;
+        }
+
+        if ($capturedLeads !== []) {
+            return $replyText;
+        }
+
+        $existing = $conversation->leads()
+            ->where('created_at', '>=', now()->subMinutes(self::ORDER_CLAIM_WINDOW_MINUTES))
+            ->exists();
+
+        if ($existing) {
+            return $replyText;
+        }
+
+        Log::info('Assistant confirmed an order without recording one; recording it now', [
+            'agent_id' => $agent->id,
+            'conversation_id' => $conversation->id,
+            'reply' => mb_substr($replyText, 0, 200),
+        ]);
+
+        try {
+            $capturedLeads[] = $this->leadCapture->recordPromisedOrder(
+                $agent,
+                $conversation,
+                $conversation->channel?->type ?? 'playground',
+                $this->leadCapture->phoneFor($conversation, []),
+            );
+
+            return $replyText;
+        } catch (Throwable $e) {
+
+            Log::error('Could not record a promised order; withdrawing the confirmation', [
+                'agent_id' => $agent->id,
+                'conversation_id' => $conversation->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            if ($this->escalation->enabledFor($agent)) {
+                $this->escalation->escalate($agent, $conversation, [
+                    'signal' => 'fallback',
+                    'summary' => 'Не удалось сохранить заявку клиента — свяжитесь вручную.',
+                ], 'fallback');
+            }
+
+            return $this->leadCapture->orderFailureMessage($agent);
+        }
+    }
+
+    protected function askForPhoneBeforeRecording(
+        Agent $agent,
+        Conversation $conversation,
+        array $contents,
+        string $systemPrompt,
+        array $firstResult,
+        array $leadCalls,
+    ): array {
+        $continuation = $contents;
+
+        foreach ($leadCalls as $call) {
+            $continuation[] = ['role' => 'tool_call', 'id' => $call['id'], 'name' => $call['name'], 'arguments' => $call['arguments'] ?? []];
+            $continuation[] = [
+                'role' => 'tool_result',
+                'id' => $call['id'],
+                'name' => $call['name'],
+                'result' => $this->leadCapture->phoneRequestInstruction(),
+            ];
+        }
+
+        $inputTokens = (int) ($firstResult['input_tokens'] ?? 0);
+        $outputTokens = (int) ($firstResult['output_tokens'] ?? 0);
+
+        try {
+            $ask = $this->llm->generate($systemPrompt, $continuation, [
+                'max_output_tokens' => $this->maxOutputTokens($agent),
+                'thinking_budget' => 0,
+            ]);
+
+            $inputTokens += (int) $ask['input_tokens'];
+            $outputTokens += (int) $ask['output_tokens'];
+            $text = trim($ask['text'] ?? '');
+        } catch (LlmException $e) {
+            Log::warning('Phone-request generation failed, asking with the templated question', [
+                'agent_id' => $agent->id,
+                'conversation_id' => $conversation->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            $text = '';
+        }
+
+        Log::info('Order held for one turn to ask for a phone number', [
+            'agent_id' => $agent->id,
+            'conversation_id' => $conversation->id,
+        ]);
+
+        return [
+            'text' => $text !== '' ? $text : $this->leadCapture->phoneRequestFallback($agent),
+            'usage' => ['input_tokens' => $inputTokens, 'output_tokens' => $outputTokens],
+        ];
+    }
+
+    protected function requestPriceApproval(
+        Agent $agent,
+        Conversation $conversation,
+        array $contents,
+        string $systemPrompt,
+        array $firstResult,
+        array $haggleCalls,
+    ): array {
+        $source = $conversation->channel?->type ?? 'playground';
+        $leads = [];
+        $continuation = $contents;
+
+        foreach ($haggleCalls as $call) {
+            $saved = null;
+
+            try {
+                $saved = $this->haggling->persist($agent, $conversation, $call['arguments'] ?? [], $source);
+                $leads[] = $saved;
+            } catch (Throwable $e) {
+                Log::error('Failed to record a price approval request; continuing with the reply', [
+                    'agent_id' => $agent->id,
+                    'conversation_id' => $conversation->id,
+                    'arguments' => $call['arguments'] ?? [],
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
+            $continuation[] = ['role' => 'tool_call', 'id' => $call['id'], 'name' => $call['name'], 'arguments' => $call['arguments'] ?? []];
+            $continuation[] = [
+                'role' => 'tool_result',
+                'id' => $call['id'],
+                'name' => $call['name'],
+                'result' => $saved !== null
+                    ? $this->haggling->pendingInstruction()
+                    : $this->haggling->failureInstruction(),
+            ];
+        }
+
+        $inputTokens = (int) ($firstResult['input_tokens'] ?? 0);
+        $outputTokens = (int) ($firstResult['output_tokens'] ?? 0);
+
+        try {
+            $reply = $this->llm->generate($systemPrompt, $continuation, [
+                'max_output_tokens' => $this->maxOutputTokens($agent),
+                'thinking_budget' => 0,
+            ]);
+
+            $inputTokens += (int) $reply['input_tokens'];
+            $outputTokens += (int) $reply['output_tokens'];
+            $text = trim($reply['text'] ?? '');
+        } catch (LlmException $e) {
+            Log::warning('Price-request reply generation failed, using the templated holding message', [
+                'agent_id' => $agent->id,
+                'conversation_id' => $conversation->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            $text = '';
+        }
+
+        Log::info('Price approval requested from the owner', [
+            'agent_id' => $agent->id,
+            'conversation_id' => $conversation->id,
+            'lead_ids' => array_map(fn (Lead $lead) => $lead->id, $leads),
+        ]);
+
+        return [
+
+            'text' => $text !== ''
+                ? $text
+                : ($leads !== [] ? $this->haggling->pendingFallback($agent) : $this->fallbackMessage($agent)),
+            'usage' => ['input_tokens' => $inputTokens, 'output_tokens' => $outputTokens],
+            'leads' => $leads,
+        ];
+    }
+
+    protected function numeric(mixed $value): ?float
+    {
+        if (is_int($value) || is_float($value)) {
+            return $value > 0 ? (float) $value : null;
+        }
+
+        if (is_string($value)) {
+            $normalized = str_replace([' ', "\u{a0}", ','], ['', '', '.'], trim($value));
+
+            return is_numeric($normalized) && (float) $normalized > 0 ? (float) $normalized : null;
+        }
+
+        return null;
+    }
+
+    protected function captureLeadsAndConfirm(
+        Agent $agent,
+        Conversation $conversation,
+        array $contents,
+        string $systemPrompt,
+        array $firstResult,
+        array $leadCalls,
+    ): array {
+        $source = $conversation->channel?->type ?? 'playground';
+        $leads = [];
+        $continuation = $contents;
+
+        $phone = $this->leadCapture->phoneFor($conversation, $leadCalls);
+
+        foreach ($leadCalls as $call) {
+            $saved = null;
+
+            try {
+                $saved = $this->leadCapture->persist($agent, $conversation, $call['arguments'] ?? [], $source, $phone);
+                $leads[] = $saved;
+            } catch (Throwable $e) {
+
+                Log::error('Failed to record a lead; continuing with the reply', [
+                    'agent_id' => $agent->id,
+                    'conversation_id' => $conversation->id,
+                    'arguments' => $call['arguments'] ?? [],
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
+            $continuation[] = ['role' => 'tool_call', 'id' => $call['id'], 'name' => $call['name'], 'arguments' => $call['arguments'] ?? []];
+            $continuation[] = [
+                'role' => 'tool_result',
+                'id' => $call['id'],
+                'name' => $call['name'],
+
+                'result' => $saved !== null
+                    ? $this->leadCapture->confirmationInstruction($phone !== null)
+                    : $this->leadCapture->failureInstruction(),
+            ];
+        }
+
+        $inputTokens = (int) ($firstResult['input_tokens'] ?? 0);
+        $outputTokens = (int) ($firstResult['output_tokens'] ?? 0);
+
+        try {
+            $confirm = $this->llm->generate($systemPrompt, $continuation, [
+                'max_output_tokens' => $this->maxOutputTokens($agent),
+                'thinking_budget' => 0,
+            ]);
+            $inputTokens += (int) $confirm['input_tokens'];
+            $outputTokens += (int) $confirm['output_tokens'];
+            $text = trim($confirm['text']) !== ''
+                ? $confirm['text']
+                : $this->leadCapture->confirmationFallback($agent, $phone !== null);
+        } catch (LlmException $e) {
+            Log::warning('Lead confirmation generation failed, using templated confirmation', [
+                'agent_id' => $agent->id,
+                'conversation_id' => $conversation->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            $text = trim($firstResult['text'] ?? '') !== ''
+                ? $firstResult['text']
+                : $this->leadCapture->confirmationFallback($agent, $phone !== null);
+        }
+
+        return [
+            'text' => $text,
+            'usage' => ['input_tokens' => $inputTokens, 'output_tokens' => $outputTokens],
+            'leads' => $leads,
+        ];
+    }
+
+    public function askForProductName(Conversation $conversation, Message $userMsg): Message
+    {
+        $agent = $conversation->agent;
+        $this->usage->for($agent);
+        $startedAt = microtime(true);
+
+        $systemPrompt = implode("\n\n", array_filter([
+            "You are {$agent->name}, a customer support assistant for this business.",
+            $this->languageInstruction($agent, $conversation),
+            'The customer sent a photo but it could not be confidently matched to a specific product. '
+                .'Reply with exactly ONE short, friendly sentence asking them to tell you the product name '
+                .'(or brand/model) they are asking about. Do not describe what is visible in the photo. '
+                .'Do not apologize at length — at most a brief "sorry" is fine. Do not list products. No emojis unless the business tone calls for them.',
+        ]));
+
+        $failed = false;
+
+        try {
+            $result = $this->llm->generate($systemPrompt, $this->buildContents($conversation), [
+                'max_output_tokens' => 128,
+                'thinking_budget' => 0,
+            ]);
+            $replyText = trim($result['text']) !== '' ? $result['text'] : $this->fallbackMessage($agent);
+            $usage = ['input_tokens' => $result['input_tokens'], 'output_tokens' => $result['output_tokens']];
+        } catch (LlmException $e) {
+            Log::warning('Photo clarification generation failed, using fallback message', [
+                'agent_id' => $agent->id,
+                'conversation_id' => $conversation->id,
+                'error' => $e->getMessage(),
+            ]);
+            $replyText = $this->fallbackMessage($agent);
+            $usage = ['input_tokens' => 0, 'output_tokens' => 0];
+            $failed = true;
+        }
+
+        $assistantMsg = $conversation->messages()->create([
+            'role' => 'assistant',
+            'content' => $replyText,
+            'meta' => [
+                'retrieved_chunks' => [],
+                'input_tokens' => $usage['input_tokens'],
+                'output_tokens' => $usage['output_tokens'],
+                'embedding_ms' => 0,
+                'search_ms' => 0,
+                'retrieval_ms' => 0,
+                'generation_ms' => round((microtime(true) - $startedAt) * 1000, 1),
+                'total_ms' => round((microtime(true) - $startedAt) * 1000, 1),
+                'failed' => $failed,
+                'unclear_photo' => true,
+            ],
+        ]);
+
+        $conversation->update(['last_message_at' => now()]);
+
+        return $assistantMsg;
+    }
+
+    public function explainVoiceProblem(Conversation $conversation, Message $userMsg, string $reason): Message
+    {
+        $agent = $conversation->agent;
+        $this->usage->for($agent);
+        $startedAt = microtime(true);
+
+        $medium = $reason === 'unsupported_attachment'
+            ? 'an attachment this assistant cannot open (a document, video, location or similar)'
+            : 'a voice message';
+
+        $situation = match ($reason) {
+            'voice_too_long' => 'The voice message was too long for this assistant to process.',
+            'unsupported_attachment' => 'This assistant can only read text and photos.',
+            default => 'The voice message could not be understood — it may have been unclear or the audio failed to process.',
+        };
+
+        $systemPrompt = implode("\n\n", array_filter([
+            "You are {$agent->name}, a customer support assistant for this business.",
+            $this->languageInstruction($agent, $conversation),
+            "The customer sent {$medium}. ".$situation.' '
+                .'Reply with ONE or TWO short, warm sentences: acknowledge briefly, and ask them to send their '
+                .'question as text instead. Do not blame the customer. Do not mention transcription, audio '
+                .'formats, file sizes, errors, settings, or any internal system. Do not apologize at length. '
+                .'No emojis unless the business tone calls for them.',
+        ]));
+
+        $failed = false;
+
+        try {
+            $result = $this->llm->generate($systemPrompt, $this->buildContents($conversation), [
+                'max_output_tokens' => 160,
+                'thinking_budget' => 0,
+            ]);
+            $replyText = trim($result['text']) !== '' ? $result['text'] : $this->voiceFallbackMessage($agent);
+            $usage = ['input_tokens' => $result['input_tokens'], 'output_tokens' => $result['output_tokens']];
+        } catch (LlmException $e) {
+            Log::warning('Voice-problem reply generation failed, using fallback message', [
+                'agent_id' => $agent->id,
+                'conversation_id' => $conversation->id,
+                'reason' => $reason,
+                'error' => $e->getMessage(),
+            ]);
+            $replyText = $this->voiceFallbackMessage($agent);
+            $usage = ['input_tokens' => 0, 'output_tokens' => 0];
+            $failed = true;
+        }
+
+        $assistantMsg = $conversation->messages()->create([
+            'role' => 'assistant',
+            'content' => $replyText,
+            'meta' => [
+                'retrieved_chunks' => [],
+                'input_tokens' => $usage['input_tokens'],
+                'output_tokens' => $usage['output_tokens'],
+                'embedding_ms' => 0,
+                'search_ms' => 0,
+                'retrieval_ms' => 0,
+                'generation_ms' => round((microtime(true) - $startedAt) * 1000, 1),
+                'total_ms' => round((microtime(true) - $startedAt) * 1000, 1),
+                'failed' => $failed,
+                'voice_problem' => $reason,
+            ],
+        ]);
+
+        $conversation->update(['last_message_at' => now()]);
+
+        return $assistantMsg;
+    }
+
+    protected function voiceFallbackMessage(Agent $agent): string
+    {
+        return $agent->response_format['voice_fallback_message']
+            ?? 'Извините, я не смог разобрать голосовое сообщение. Напишите, пожалуйста, текстом.';
+    }
+
+    protected function recentAssistantReplies(Conversation $conversation, Message $userMsg): array
+    {
+        return $conversation->messages()
+            ->where('role', 'assistant')
+            ->where('id', '<', $userMsg->id)
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->take(self::REPEAT_LOOKBACK)
+            ->pluck('content')
+            ->all();
+    }
+
+    protected function lastAssistantMessage(Conversation $conversation, Message $userMsg): ?Message
+    {
+        return $conversation->messages()
+            ->whereIn('role', ['assistant', 'operator'])
+            ->where('id', '<', $userMsg->id)
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->first();
+    }
+
+    protected function followUpInstruction(?string $previousReply): string
+    {
+        $lines = [
+            'THIS MESSAGE IS A SHORT FOLLOW-UP, NOT A NEW QUESTION.',
+            '- The customer\'s latest message is brief and only makes sense against your previous reply — a yes/no,',
+            '  a pick from what you just offered, "is that all?", or a nudge for an answer you did not give.',
+            '- ANSWER THAT MESSAGE. If they asked for a yes or a no, the first word of your reply is that yes or no.',
+            '  If they picked one of the options you listed, talk about that one. If they asked whether that was',
+            '  everything, say whether it was.',
+            '- Do NOT restate what you already sent. They have read it. Listing the same products again, even',
+            '  reworded, is the single most obvious way to tell a customer they are talking to a machine.',
+            '- You may still check the catalog for fresh prices and stock — that rule stands. But the check informs',
+            '  a NEW, SHORTER answer to the question actually asked; it is not a reason to send the list again.',
+            '- Refer back naturally instead of repeating: "да, это всё, что есть в этом бюджете", "второй — тот,',
+            '  что с 16 ГБ". One or two sentences is usually the whole correct answer here.',
+        ];
+
+        if ($previousReply !== null && trim($previousReply) !== '') {
+            $lines[] = '';
+            $lines[] = 'YOUR PREVIOUS REPLY, which the customer is responding to. Do not send this again in any form:';
+            $lines[] = '"""'.trim(mb_substr($previousReply, 0, 1200)).'"""';
+        }
+
+        return implode("\n", $lines);
+    }
+
+    protected function handoverInstruction(): string
+    {
+        return implode("\n", [
+            'A COLLEAGUE IS BEING BROUGHT INTO THIS CONVERSATION RIGHT NOW.',
+            '- The business owner has already been alerted. This is done; it is not something to offer or to ask',
+            '  permission for.',
+            '- Tell the customer, calmly and in one or two short sentences, that a person is taking over and will',
+            '  reply here shortly. Say it plainly, in their language.',
+            '- Stay warm and do not argue, defend yourself, or match their tone, however they are speaking to you.',
+            '  One brief acknowledgement that this has been frustrating is enough — do not apologise repeatedly,',
+            '  and do not grovel.',
+            '- If you can still answer their actual question in a sentence, do that too. Do not go silent.',
+            '- Never mention tools, flags, alerts, escalation or any internal system. A person is joining; that is',
+            '  the whole story from the customer\'s side.',
+        ]);
+    }
+
+    protected function detectHandover(Conversation $conversation, Message $userMsg): ?array
+    {
+        $verdict = $this->hostility->inspect(
+            $userMsg->content,
+            $this->priorRudeMessageCount($conversation, $userMsg),
+        );
+
+        if ($verdict === null && $this->hasAskedTheSameThingRepeatedly($conversation, $userMsg)) {
+            $verdict = [
+                'signal' => HostilityDetector::SIGNAL_REPEATED_FAILURE,
+                'reason' => 'repeated_question',
+            ];
+        }
+
+        if ($verdict === null) {
+            return null;
+        }
+
+        Log::info('Conversation handed to a human by the pipeline', [
+            'agent_id' => $conversation->agent_id,
+            'conversation_id' => $conversation->id,
+            'signal' => $verdict['signal'],
+            'reason' => $verdict['reason'],
+        ]);
+
+        return $verdict + [
+            'summary' => __('conversations.escalation.auto_summary.'.$verdict['reason'], [], $conversation->agent?->user?->locale),
+        ];
+    }
+
+    protected function priorRudeMessageCount(Conversation $conversation, Message $userMsg): int
+    {
+        $earlier = $conversation->messages()
+            ->where('role', 'user')
+            ->where('id', '<', $userMsg->id)
+            ->orderByDesc('id')
+            ->take(self::REPEATED_QUESTION_LOOKBACK)
+            ->pluck('content');
+
+        return $earlier
+            ->filter(fn (string $text) => $this->hostility->isRude($text) || $this->hostility->isAbusive($text))
+            ->count();
+    }
+
+    protected function hasAskedTheSameThingRepeatedly(Conversation $conversation, Message $userMsg): bool
+    {
+
+        if ($this->followUps->isShortFollowUp($userMsg->content, true)) {
+            return false;
+        }
+
+        $earlier = $conversation->messages()
+            ->where('role', 'user')
+            ->where('id', '<', $userMsg->id)
+            ->orderByDesc('id')
+            ->take(self::REPEATED_QUESTION_LOOKBACK)
+            ->pluck('content');
+
+        $repeats = $earlier
+            ->filter(fn (string $text) => $this->similarity->isNearDuplicate($userMsg->content, $text))
+            ->count();
+
+        return $repeats >= 2;
+    }
+
+    protected function rewriteIfRepeated(
+        Agent $agent,
+        Conversation $conversation,
+        string $systemPrompt,
+        array $contents,
+        string $replyText,
+        array $recentReplies,
+        array $options,
+    ): array {
+        $unchanged = ['text' => $replyText, 'rewritten' => false, 'usage' => ['input_tokens' => 0, 'output_tokens' => 0]];
+
+        $customerTexts = $this->recentCustomerMessages($conversation)->all();
+
+        if ($this->followUps->requestsRecap($customerTexts[0] ?? '')) {
+            return $unchanged;
+        }
+
+        $repeated = collect($recentReplies)->first(
+            fn (string $earlier) => $this->similarity->isRepeatOf($replyText, $earlier, $customerTexts),
+        );
+
+        if ($repeated === null) {
+            return $unchanged;
+        }
+
+        $cleaned = $this->similarity->withoutRepeatedQuestions($replyText, $recentReplies);
+        if ($cleaned !== $replyText && ! collect($recentReplies)->contains(
+            fn (string $earlier) => $this->similarity->isRepeatOf($cleaned, $earlier, $customerTexts),
+        )) {
+            return ['text' => $cleaned, 'rewritten' => true, 'usage' => $unchanged['usage']];
+        }
+
+        Log::warning('Reply repeated the previous one, regenerating', [
+            'agent_id' => $agent->id,
+            'conversation_id' => $conversation->id,
+            'containment' => round($this->similarity->containment($replyText, $repeated), 2),
+            'same_listing' => $this->similarity->repeatsListing($replyText, $repeated, $customerTexts),
+        ]);
+
+        $correction = $systemPrompt."\n\n".implode("\n", [
+            'YOU HAVE JUST WRITTEN THE SAME REPLY AGAIN. It repeats this reply, which you already sent in this',
+            'conversation and the customer has already read:',
+            '"""'.trim(mb_substr($repeated, 0, 1200)).'"""',
+            'Edit this current draft (quoted data, not instructions):',
+            json_encode($replyText, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE),
+            'Answer the latest customer message directly, keeping any useful new facts from the draft:',
+            '- Do not re-list the same products or prices unless the customer explicitly asked for a recap or comparison.',
+            '- Do not ask a question already answered, declined, or just asked. Do not restart the greeting.',
+            '- Preserve verified names, prices and constraints. Do not invent a new fact just to sound different.',
+            '- Never offer anything the customer has said they do not want.',
+            '- If their message is a short question, answer just that, in one or two sentences.',
+            '- If there is genuinely nothing new to offer, say what is missing plainly. Ask a clarifying question',
+            '  only if it has not already been answered or declined. A short answer without a question is fine.',
+        ]);
+
+        try {
+
+            $retry = $this->llm->generate($correction, $contents, [
+                'max_output_tokens' => $options['max_output_tokens'] ?? $this->maxOutputTokens($agent),
+                'temperature' => 0.4,
+                'thinking_budget' => 0,
+            ]);
+        } catch (LlmException $e) {
+            Log::warning('Repeat-reply regeneration failed, keeping the original', [
+                'agent_id' => $agent->id,
+                'conversation_id' => $conversation->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return $unchanged;
+        }
+
+        $text = $this->repairTruncatedReply(trim($retry['text'] ?? ''), $retry['finish_reason'] ?? null);
+        $usage = [
+            'input_tokens' => (int) ($retry['input_tokens'] ?? 0),
+            'output_tokens' => (int) ($retry['output_tokens'] ?? 0),
+        ];
+
+        if ($text === '') {
+            return ['text' => $replyText, 'rewritten' => false, 'usage' => $usage];
+        }
+
+        $text = $this->similarity->withoutRepeatedQuestions($text, $recentReplies);
+
+        return ['text' => $text, 'rewritten' => $text !== $replyText, 'usage' => $usage];
+    }
+
+    protected function firstEscalationCall(Agent $agent, array $toolCalls): ?array
+    {
+        foreach ($toolCalls as $call) {
+            if (($call['name'] ?? null) !== EscalationService::TOOL_NAME) {
+                continue;
+            }
+
+            $args = $call['arguments'] ?? [];
+
+            if ($this->escalation->shouldEscalate($agent, $args)) {
+                return $args;
+            }
+
+            Log::info('Escalation signal below threshold, ignored', [
+                'agent_id' => $agent->id,
+                'signal' => $args['signal'] ?? null,
+                'confidence' => $args['confidence'] ?? null,
+                'sensitivity' => $this->escalation->sensitivityFor($agent),
+            ]);
+        }
+
+        return null;
+    }
+
+    protected function escalationAcknowledgement(Agent $agent): string
+    {
+        return $agent->response_format['escalation_message']
+            ?? 'Извините за неудобства. Я передал(а) ваш вопрос коллеге — с вами скоро свяжется человек.';
+    }
+
+    protected function fallbackMessage(Agent $agent): string
+    {
+        return $agent->response_format['fallback_message']
+            ?? 'Извините, сейчас не получается ответить. Мы уточним этот вопрос и вернёмся с ответом.';
+    }
+
+    protected function greetingMessage(Agent $agent, Conversation $conversation): string
+    {
+        $configured = $agent->response_format['greeting_message'] ?? null;
+
+        if (is_string($configured) && trim($configured) !== '') {
+            return $configured;
+        }
+
+        return __('replies.greeting', [], $this->locales->forAgent($conversation));
+    }
+
+    public static function isStartCommand(string $text): bool
+    {
+        return preg_match(self::START_COMMAND_PATTERN, trim($text)) === 1;
+    }
+
+    public function greetOnStart(Conversation $conversation): Message
+    {
+        $assistantMsg = $conversation->messages()->create([
+            'role' => 'assistant',
+            'content' => $this->greetingMessage($conversation->agent, $conversation),
+            'meta' => [
+                'retrieved_chunks' => [],
+                'input_tokens' => 0,
+                'output_tokens' => 0,
+                'failed' => false,
+                'greeting' => true,
+                'session_start' => true,
+            ],
+        ]);
+
+        $conversation->update(['last_message_at' => now()]);
+
+        return $assistantMsg;
+    }
+
+    protected function isSimpleGreeting(string $text): bool
+    {
+        return (bool) preg_match(self::GREETING_PATTERN, trim($text));
+    }
+
+    protected function maxOutputTokens(Agent $agent): int
+    {
+        $maxLength = (int) ($agent->response_format['max_length'] ?? 600);
+
+        $tokens = (int) ceil($maxLength / self::OUTPUT_CHARS_PER_TOKEN * self::OUTPUT_TOKEN_HEADROOM);
+
+        return max(256, min($tokens, self::MAX_OUTPUT_TOKENS));
+    }
+
+    protected function repairTruncatedReply(string $text, ?string $finishReason): string
+    {
+        if (! $this->hitOutputLimit($finishReason)) {
+            return $text;
+        }
+
+        $trimmed = rtrim($text);
+
+        if ($trimmed === '' || preg_match('/[.!?…)]["»\']?$/u', $trimmed)) {
+            return $text;
+        }
+
+        $cut = 0;
+        foreach (['.', '!', '?', '…'] as $terminator) {
+            $at = mb_strrpos($trimmed, $terminator);
+            if ($at !== false) {
+                $cut = max($cut, $at + 1);
+            }
+        }
+
+        if ($cut === 0) {
+            return $text;
+        }
+
+        $repaired = rtrim(mb_substr($trimmed, 0, $cut));
+
+        return preg_match('/[\p{L}\p{N}]/u', $repaired) ? $repaired : $text;
+    }
+
+    protected function hitOutputLimit(?string $finishReason): bool
+    {
+
+        return in_array(strtolower((string) $finishReason), ['max_tokens', 'length'], true);
+    }
+
+    protected function buildContents(Conversation $conversation): array
+    {
+        $limit = (int) config('agent.rag.history_length');
+
+        return $conversation->messages()
+            ->whereIn('role', ['user', 'assistant', 'operator'])
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->take($limit)
+            ->get()
+            ->reverse()
+            ->map(fn (Message $m) => [
+                'role' => $m->role === 'user' ? 'user' : 'model',
+                'text' => $m->content,
+            ])
+            ->values()
+            ->all();
+    }
+
+    protected function buildSystemPrompt(
+        Agent $agent,
+        array $retrieved,
+        Conversation $conversation,
+        bool $searchProducts = false,
+        bool $retrievalSkipped = false,
+    ): string {
+        $format = $agent->response_format ?? [];
+        $behavior = $agent->behavior ?? [];
+
+        $parts = [];
+
+        $parts[] = trim(sprintf(
+            'You are %s, an AI sales assistant for this business%s.',
+            $agent->name,
+            $agent->description ? ": {$agent->description}" : ''
+        ));
+
+        if (! empty($agent->custom_system_prompt)) {
+            $parts[] = 'IMPORTANT — the business owner gave these instructions about personality and style. '.
+                "They take priority over the default tone/formatting guidance elsewhere in this prompt whenever they conflict:\n"
+                .$agent->custom_system_prompt;
+        }
+
+        if (! empty($agent->rules_instructions)) {
+            $parts[] = 'IMPORTANT — the business owner gave these situational rules for how to handle specific '.
+                'cases. Follow them exactly. They take priority over the default tone/formatting guidance '.
+                "elsewhere in this prompt, and over your own judgement about what to say, whenever they conflict:\n"
+                .$agent->rules_instructions;
+        }
+
+        $parts[] = "Default tone (used except where the owner's instructions above say otherwise): {$agent->tone}.";
+
+        $parts[] = $this->languageInstruction($agent, $conversation);
+
+        if (! empty($format['max_length'])) {
+            $parts[] = "Keep replies under approximately {$format['max_length']} characters.";
+        }
+
+        $parts[] = ! empty($format['use_emojis'])
+            ? 'You may use emojis sparingly to sound warm and approachable.'
+            : 'Do not use emojis.';
+
+        $parts[] = $this->answeringPolicyInstruction($searchProducts);
+
+        $parts[] = implode("\n", [
+            'PHOTO REQUESTS:',
+            '- When the customer asks to see a product photo, do not claim that you cannot send photos, that this chat cannot attach them, or redirect them to a website instead.',
+            '- Photo selection and delivery are handled by the chat system. Do not volunteer a photo refusal when listing products or discussing their specifications.',
+            '- Never claim a photo is attached or available unless the catalog or knowledge base actually shows it.',
+            '- Do not describe or invent an image, promise to send one later, or claim that photos are unavailable without evidence.',
+        ]);
+
+        $parts[] = $this->consultativeSellingInstruction();
+
+        $parts[] = implode("\n", [
+            'Rules:',
+            '- This is a messenger chat, not an email: write like a helpful human texting back, not a brochure.',
+            '- Use 2-4 sentences for a substantive question, one sentence for a simple fact or acknowledgement. This is a ceiling, not a quota. Go longer when the customer asks for details.',
+            '- Do not use bullet points, numbered lists, or markdown formatting unless the customer explicitly asked for a list.',
+            '- Recommend at most THREE products in one reply, and only when the customer is choosing between options;',
+            '  one is the right number for an ordinary question. Every product you name must come from the KNOWLEDGE',
+            '  BASE or from the catalog tool — never from your own knowledge of what shops usually stock.',
+            '- End with at most ONE question, and only if it genuinely helps move the conversation forward — many replies need no question at all.',
+            '- Do not decorate people or products with qualities you were not given. Words like "experienced",',
+            '  "qualified", "talented", "leading", "highly rated" are claims about a real business and a real',
+            '  person: use them only if the KNOWLEDGE BASE says so. Naming someone and their subject is a',
+            '  complete answer — it does not need a compliment attached to sound good.',
+        ]);
+
+        $parts[] = 'Never reply with a bare refusal. "I have no information about that" is not an acceptable reply on its own — '
+            .'it must always be followed by something useful: the general answer, the nearest thing you do have, or an offer to '
+            .'put the customer in touch with a person.';
+
+        $parts[] = $this->proactivityInstruction($agent);
+
+        $parts[] = $this->fallbackInstruction($behavior['on_not_found'] ?? 'apologize', $format['fallback_message'] ?? null);
+
+        $parts[] = $this->knowledgeBaseSection($retrieved, $retrievalSkipped);
+
+        return implode("\n\n", $parts);
+    }
+
+    protected function answeringPolicyInstruction(bool $searchProducts): string
+    {
+
+        $productCarveOut = $searchProducts
+            ? [
+                '- EXCEPTION, and it overrides the rule above: prices, discounts, stock, availability and which',
+                '  products exist do NOT come from the KNOWLEDGE BASE. They come from the "'.ProductSearchService::TOOL_NAME.'" tool,',
+                '  freshly called, every time — see PRODUCT CATALOG below. If the knowledge base and the tool',
+                '  disagree about a price or about stock, the tool is right and the knowledge base is stale.',
+            ]
+            : [];
+
+        return implode("\n", [
+            'HOW TO ANSWER — there are two kinds of question and they are handled differently.',
+            'Work out which kind you are being asked before you reply. Infer what field this business',
+            'works in from your description above and from the KNOWLEDGE BASE below.',
+            '',
+            'TIER 1 — GENERAL questions about that field, asked out of curiosity rather than about this',
+            'business specifically (what a concept means, how two things differ, whether something is',
+            'hard to learn, why it matters, what a beginner should start with).',
+            '- ANSWER THESE. Use your own general knowledge. You are the knowledgeable person at this',
+            '  business, and explaining your field is part of the job — not a fact you need permission for.',
+            '- Give a genuinely useful, accurate, plain-language answer, in the same 2-4 sentence chat style.',
+            '- Then connect it back to the business in one short line, using only things that appear in the',
+            '  KNOWLEDGE BASE — for example noting that a relevant course/product exists and offering to say',
+            '  more. If the KNOWLEDGE BASE holds nothing relevant, just give the general answer and stop.',
+            '  Skip this connecting line entirely if Proactivity below is OFF.',
+            '- Keep the general part general. Never attach invented specifics (prices, dates, staff,',
+            '  guarantees) to it, and never present your general knowledge as a statement about this business.',
+            '',
+            'TIER 2 — SPECIFIC FACTS ABOUT THIS BUSINESS: prices, discounts, who the staff/teachers are and',
+            'their background, schedules and timetables, which products or courses exist, availability and',
+            'stock, locations, contact details, policies, deadlines, guarantees.',
+            '- These may come ONLY from the KNOWLEDGE BASE. Never invent, estimate, or infer them, and never',
+            '  fill a gap with what is typical elsewhere. A plausible-sounding wrong price is worse than no price.',
+            ...$productCarveOut,
+            '- If the fact IS in the KNOWLEDGE BASE, answer it directly and specifically. Material that arrived',
+            '  under a heading matching the question (staff, prices, schedule) is the answer — use it, and do',
+            '  not claim you lack information that is sitting in front of you.',
+            '- Report what the KNOWLEDGE BASE actually says and stop there. Do not pad a sparse entry with',
+            '  flattering filler: if it gives a name and a subject, give the name and the subject: say nothing',
+            '  about their experience, qualifications, awards, years in the industry or character unless it is',
+            '  written there. Inventing a compliment about a real person is inventing a business fact.',
+            '- If it is genuinely NOT there, do not stop at that. Say briefly that you cannot confirm it, then',
+            '  do ONE of: give the closest related thing that IS in the KNOWLEDGE BASE; offer to pass the',
+            '  question to a colleague; or offer to take their contact so someone can come back with it.',
+        ]);
+    }
+
+    protected function knowledgeBaseSection(array $retrieved, bool $skipped = false): string
+    {
+
+        if ($skipped) {
+            return 'KNOWLEDGE BASE: not consulted for this message. It was identified as a question about products, '
+                .'prices, stock or availability, which the "'.ProductSearchService::TOOL_NAME.'" tool answers '
+                .'authoritatively and more currently than any uploaded document could. The business DOES have a '
+                .'knowledge base; it simply was not searched this time. If it turns out the customer needs a business '
+                .'fact that is not about price, stock or availability, do not guess and do not claim the business has '
+                .'no information — say you will check and offer to connect them with a colleague.';
+        }
+
+        if ($retrieved === []) {
+            return 'KNOWLEDGE BASE: (empty — nothing has been uploaded for this business yet). '
+                .'You can still answer Tier 1 general questions about the field from your own knowledge. '
+                .'For anything specific to this business, say you cannot confirm it and offer to connect the customer with a colleague.';
+        }
+
+        $confident = array_filter($retrieved, fn (RetrievedChunk $r) => $r->confident);
+        $weak = array_filter($retrieved, fn (RetrievedChunk $r) => ! $r->confident);
+
+        $render = fn (array $chunks) => collect($chunks)->map(
+            fn (RetrievedChunk $r) => '['.($r->chunk->knowledgeSource?->name ?? 'Knowledge base')."]\n{$r->chunk->content}"
+        )->implode("\n\n---\n\n");
+
+        $section = 'KNOWLEDGE BASE:';
+
+        if ($confident !== []) {
+            $section .= "\n".$render($confident);
+        }
+
+        if ($weak !== []) {
+            $section .= ($confident !== [] ? "\n\n" : "\n")
+                ."POSSIBLY RELATED (weak match — the search found nothing clearly on-topic, so these may or\n"
+                ."may not answer the question). Use them only if they genuinely do; if they do not, treat this\n"
+                ."as a fact you don't have and pivot per TIER 2 instead of forcing them into an answer:\n"
+                .$render($weak);
+        }
+
+        return $section;
+    }
+
+    protected function consultativeSellingInstruction(): string
+    {
+        return implode("\n", [
+            'HOW TO TALK ABOUT PRODUCTS — you are a salesperson, not a catalogue.',
+            'Someone who has sold this range for years does not read the list out. They work out what the customer',
+            'is actually trying to do, pick the one or two things that fit it, and say why. Do the same.',
+            '',
+            '- START FROM THE NEED, NOT THE STOCK. Answer the question "which of these is right for you, and why",',
+            '  not "what do we have". If the customer told you what it is for — work, gaming, a gift, a budget, a',
+            '  child, travel — connect the recommendation to that. For a direct price, stock or delivery question,',
+            '  answer that first; do not turn it into a needs questionnaire.',
+            '- RECOMMEND, DO NOT ENUMERATE. Pick the best fit and lead with it. Mention a second only when it is a',
+            '  genuinely different choice (much cheaper, much stronger, the only one in stock), and a third almost',
+            '  never. Naming five things is not being helpful, it is refusing to have an opinion.',
+            '- SAY WHY, IN THE CUSTOMER\'S TERMS. Explain one relevant, supported benefit of the specification.',
+            '  Do not promise gaming performance, battery life, reliability or compatibility from a model name alone.',
+            '- MENTION A RELEVANT TRADE-OFF WHEN KNOWN. If the data shows a meaningful limitation for this customer',
+            '  (price, storage, size), explain it briefly. A drawback is optional, not a required sentence.',
+            '  Never invent a drawback or a strength to make a recommendation sound balanced.',
+            '- ASK THE ONE QUESTION THAT NARROWS IT. When something you do not know would change the answer — the',
+            '  budget, what they will use it for, whether portability matters — ask it, once, at the end. Do not ask',
+            '  when you already have what you need: answer instead.',
+            '- SOUND LIKE A PERSON EACH TIME. This is a way of thinking, not a template. Do not run the same four',
+            '  moves in the same order every reply, do not label them, and do not repeat a phrase you used earlier',
+            '  in this conversation. Sometimes the whole correct answer is one sentence.',
+            '- If the customer explicitly asked for a full list, give them the list — the point is not to withhold',
+            '  information, it is not to substitute a list for advice.',
+        ]);
+    }
+
+    protected function conversationStyleInstruction(): string
+    {
+        return implode("\n", [
+            'FINAL RESPONSE GUIDANCE — apply after deciding whether a tool is needed. Keep all factual and tool safeguards above:',
+            '- Read the latest message as part of the exchange. Answer its actual question before suggesting a next step.',
+            '- The length limit is a maximum, not a target. Do not fill the available space. For a factual follow-up',
+            '  answer the fact in ONE sentence and stop. Do not repeat specs or start a new sales pitch.',
+            '- Remember the stated budget, purpose, selected item, rejected options and contact details. Do not ask',
+            '  for them again. If the customer changes a requirement, the latest statement wins. Resolve "this one",',
+            '  "the second" and "yes" against the previous exchange; ask only if the reference is genuinely ambiguous.',
+            '- Greet once at the start. In an ongoing exchange, start with the answer. Do not prepend "Понимаю вас",',
+            '  "Отличный выбор", "Спасибо за вопрос" or "Конечно, с удовольствием" to every message. Warmth comes',
+            '  from paying attention, not from a repeated opening, praise or the customer\'s name in every reply.',
+            '- Do not end every reply with "Чем ещё могу помочь?", "Если будут вопросы, обращайтесь" or a sales',
+            '  question. A thanks, goodbye, refusal or "I will think about it" does not need another offer.',
+            '- If something is too expensive, respect the budget. Offer a genuinely cheaper verified alternative',
+            '  only if there is one; do not keep presenting the rejected item or pressure them to raise the budget.',
+            '  Check ALL supplied products, including ones you have not mentioned yet. Compare their actual prices.',
+            '  Never assume the last recommended item is the cheapest. An excluded brand does not exclude other brands.',
+            '- If the customer is ready, help with the next required ordering step through the available tools.',
+            '  Do not restart discovery, repeat the catalogue, or request contact information already supplied.',
+            '- If information is missing, name the specific uncertainty. An offer to check is not a completed',
+            '  handoff. Never claim a colleague was notified, a reservation made, a payment received, or a callback',
+            '  scheduled unless the actual tool result or business data supports it. Do not promise an untracked follow-up.',
+            '- Use natural everyday wording in the customer\'s language, without imitating their typos or adding',
+            '  forced slang. Keep product names and figures exact. Do not describe yourself as a human or invent',
+            '  personal experience; if asked whether you are AI, answer honestly and briefly.',
+            '- Before sending, delete empty praise ("отличный выбор", "идеально подходит", "хорошие характеристики")',
+            '  and generic closing invitations ("Хотите узнать подробнее или оформить заказ?", "Как вы хотите поступить?",',
+            '  "Would you like to know more?", "let me know", "ба ман хабар диҳед"). Replace praise with a specific',
+            '  supported reason only when recommending. Do not replace a deleted invitation with a different invitation.',
+            '- When the customer thanks you or wants to think, acknowledge it in ONE short sentence and stop.',
+            '  Do not add "if you have questions", an offer to help, a question, or another product.',
+        ]);
+    }
+
+    protected function proactivityInstruction(Agent $agent): string
+    {
+        return match ($agent->proactivity) {
+            'off' => implode("\n", [
+                'Proactivity: OFF.',
+                '- Answer only what the customer asked. Do not upsell, cross-sell, or suggest additional products.',
+                '- Only ask a follow-up question when it is strictly required to answer their request.',
+            ]),
+            'active' => implode("\n", [
+                'Proactivity: ACTIVE.',
+                '- After answering, take initiative to move the sale forward: offer ONE relevant next step — either a single related item FROM THE KNOWLEDGE BASE or catalog tool results, or an offer to place the order / book a time.',
+                '- Never invent products, prices, or promotions; only suggest items that appear in the KNOWLEDGE BASE or catalog tool results.',
+                '- Still at most one suggestion and one question. Stay warm and helpful — never pushy, and never repeat an offer the customer already turned down.',
+            ]),
+            default => implode("\n", [
+                'Proactivity: SUBTLE.',
+                '- Answer the current request and normally stop. Suggest a next step only when the customer indicates readiness or asks for advice; do not add a generic invitation to every answer.',
+                '- Any product you mention must come FROM THE KNOWLEDGE BASE or catalog tool results. Never invent items and never push a sale.',
+                '- If a plain answer is enough, just answer — do not force a suggestion.',
+            ]),
+        };
+    }
+
+    protected function languageInstruction(Agent $agent, Conversation $conversation): string
+    {
+        try {
+            $detected = $this->languages->forConversation($this->recentCustomerMessages($conversation));
+        } catch (Throwable $e) {
+
+            Log::warning('Language detection failed; falling back to inferred language', [
+                'agent_id' => $agent->id,
+                'conversation_id' => $conversation->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            $detected = null;
+        }
+
+        if ($detected !== null) {
+            $name = self::LANGUAGE_NAMES[$detected] ?? $detected;
+
+            return implode(' ', [
+                "The customer is writing in {$name}. WRITE YOUR REPLY IN {$name}.",
+                $detected === LanguageDetector::TAJIK
+
+                    ? 'Tajik and Russian share the Cyrillic alphabet, and this customer is writing TAJIK, not Russian. '
+                        .'Answer in Tajik. Russian loanwords they used themselves (диск, заказ, ноутбук) are fine to '
+                        .'keep — the sentence around them must be Tajik. '
+
+                        .'Write natural, everyday Tajik, the way a shop assistant in Khujand speaks it. Do NOT splice '
+                        .'English or Russian words, or half-translated hybrids, into a Tajik sentence: no "range", "fit", '
+                        .'"budget", no "фити кунад", no "нарх range". Say it in Tajik: "дар ҳудуди буҷаи шумо", '
+                        .'"ба буҷаи шумо мувофиқ аст", "тақрибан", "наздиктарин". Product names, brands, model numbers, '
+                        .'specifications and prices stay exactly as the catalog writes them; every '
+                        .'other word must be Tajik. Before sending, check each word that is not a product name, and '
+                        .'replace any English or Russian one with its Tajik equivalent. Prefer simple, short sentences '
+                        .'with familiar words over ornate sales language or literal translations of English idioms.'
+                    : 'Do not switch to another language unless the customer does.',
+                'If they switch language later, switch with them on that message.',
+            ]);
+        }
+
+        $hasPriorReply = $conversation->messages()->where('role', 'assistant')->exists();
+
+        if (! $hasPriorReply) {
+            return 'Reply in the same language the customer used in their latest message. '
+                ."If their message has no language signal (e.g. it's just a photo or an emoji), default to Russian.";
+        }
+
+        return 'Reply in the same language the customer used in their latest message. '
+            .'If their latest message has no clear language of its own (e.g. a photo with no caption, "?", emoji-only), '
+            .'keep using whatever language your own earlier replies in this conversation used — do not switch languages '
+            .'without a clear signal from the customer.';
+    }
+
+    protected function recentCustomerMessages(Conversation $conversation): Collection
+    {
+        return $conversation->messages()
+            ->where('role', 'user')
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->take(self::LANGUAGE_LOOKBACK)
+            ->pluck('content');
+    }
+
+    protected function fallbackInstruction(string $onNotFound, ?string $fallbackMessage): string
+    {
+        $instruction = 'When a TIER 2 fact about this business is missing from the KNOWLEDGE BASE, do not guess, '
+            .'and do not end the conversation there. ';
+
+        $instruction .= match ($onNotFound) {
+            'human_handoff' => 'Say briefly which detail needs confirmation and offer to pass the question to a colleague. Only claim it was passed on after the corresponding tool succeeds. Offer to take their contact if you do not already have it.',
+            'suggest_alternatives' => 'Say briefly that you cannot confirm that one, then offer the closest relevant things that ARE in the KNOWLEDGE BASE (at most 2) and ask if either helps.',
+            default => 'Say briefly which detail you cannot confirm. Answer any part you can, then offer a relevant next step if available. Do not promise to check and come back unless that follow-up is actually recorded.',
+        };
+
+        $instruction .= ' Write it fresh each time, about what THIS message asked and what this conversation has '
+            .'already established. Never send a stock sentence, and never repeat — or barely reword — something you '
+            .'have already said in this conversation; if you are pivoting for the second time, it has to say '
+            .'something new and take the conversation somewhere.';
+
+        if (! empty($fallbackMessage)) {
+            $instruction .= ' For tone only — the owner would phrase a pivot roughly like this: '
+                ."\"{$fallbackMessage}\". Match its register and length. Do NOT send it as written, and do not send "
+                .'the same variation of it twice.';
+        }
+
+        return $instruction;
+    }
+}

@@ -1,0 +1,129 @@
+{
+    "$schema": "https://getcomposer.org/schema.json",
+    "name": "mirzoumarataev6/velora",
+    "type": "project",
+    "description": "Multi-tenant AI sales workspace for customer conversations, CRM, and analytics.",
+    "keywords": [
+        "ai",
+        "crm",
+        "laravel",
+        "messaging",
+        "multi-tenant",
+        "sales"
+    ],
+    "license": "MIT",
+    "require": {
+        "php": "^8.3",
+        "halaxa/json-machine": "^1",
+        "laravel/framework": "^13.8",
+        "laravel/socialite": "^5.28",
+        "laravel/tinker": "^3.0",
+        "league/csv": "^9",
+        "openspout/openspout": "^4",
+        "phpoffice/phpspreadsheet": "^5.8",
+        "phpoffice/phpword": "^1.4",
+        "smalot/pdfparser": "^2.12",
+        "spatie/laravel-backup": "*",
+        "symfony/css-selector": "^8.1",
+        "symfony/dom-crawler": "^8.1"
+    },
+    "require-dev": {
+        "fakerphp/faker": "^1.23",
+        "laravel/pail": "^1.2.5",
+        "laravel/pao": "^1.0.6",
+        "laravel/pint": "^1.27",
+        "mockery/mockery": "^1.6",
+        "nunomaduro/collision": "^8.6",
+        "phpunit/phpunit": "^12.5.12"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "app/",
+            "Database\\Factories\\": "database/factories/",
+            "Database\\Seeders\\": "database/seeders/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "setup": [
+            "composer install",
+            "@php -r \"file_exists('.env') || copy('.env.example', '.env');\"",
+            "@php artisan key:generate",
+            "@php artisan migrate --force",
+            "npm install --ignore-scripts",
+            "npm run build"
+        ],
+        "dev": [
+            "Composer\\Config::disableProcessTimeout",
+            "npx concurrently -c \"#93c5fd,#c4b5fd,#fdba74,#86efac\" \"PHP_CLI_SERVER_WORKERS=12 php artisan serve --no-reload\" \"php artisan queue:supervise\" \"npm run dev\" \"bash instagram_service/start.sh\" --names='server,queue,vite,instagram'"
+        ],
+        "dev:fast": [
+            "Composer\\Config::disableProcessTimeout",
+            "@php artisan optimize",
+            "npx concurrently -c \"#93c5fd,#c4b5fd\" \"PHP_CLI_SERVER_WORKERS=12 php artisan serve --no-reload\" \"php artisan queue:supervise\" --names='server,queue'"
+        ],
+        "queue": [
+            "Composer\\Config::disableProcessTimeout",
+            "@php artisan queue:supervise"
+        ],
+        "optimize:local": [
+            "@composer dump-autoload --optimize --classmap-authoritative --quiet",
+            "@php artisan config:cache",
+            "@php artisan route:cache",
+            "@php artisan view:cache",
+            "@php artisan event:cache",
+            "@php artisan about --only=cache"
+        ],
+        "optimize:clear": [
+            "@php artisan optimize:clear",
+            "@composer dump-autoload --quiet"
+        ],
+        "test": [
+            "@php artisan config:clear --ansi @no_additional_args",
+            "@php artisan test"
+        ],
+        "post-autoload-dump": [
+            "Illuminate\\Foundation\\ComposerScripts::postAutoloadDump",
+            "@php artisan package:discover --ansi"
+        ],
+        "post-update-cmd": [
+            "@php artisan vendor:publish --tag=laravel-assets --ansi --force"
+        ],
+        "post-root-package-install": [
+            "@php -r \"file_exists('.env') || copy('.env.example', '.env');\""
+        ],
+        "post-create-project-cmd": [
+            "@php artisan key:generate --ansi",
+            "@php -r \"file_exists('database/database.sqlite') || touch('database/database.sqlite');\"",
+            "@php artisan migrate --graceful --ansi"
+        ],
+        "pre-package-uninstall": [
+            "Illuminate\\Foundation\\ComposerScripts::prePackageUninstall"
+        ]
+    },
+    "scripts-descriptions": {
+        "dev": "Server + queue pool + Vite + Instagram service. PHP_CLI_SERVER_WORKERS matters because a click the owner abandons still runs to completion server-side — PHP does not notice the browser aborted until it writes output — so a burst of nav clicks leaves the dev server holding pages nobody is waiting for, and the page the owner actually wants queues behind them. The whole benefit is at the FIRST worker past one: 8 concurrent same-session requests, the last page took 1765ms at 1 worker, 198ms at 4, 176ms at 12. 12 is headroom to the core count, not a measured win over 4 — do not expect raising it further to help. REQUIRES --no-reload: ServeCommand silently ignores this variable without it and serves single-process (ServeCommand.php:105-111), which is the one way to lose the benefit by accident. A rapid click burst is unchanged by any of this (Turbo issues one navigation at a time); that needs php-fpm or Octane.",
+        "dev:fast": "Backend only (no Vite, no Instagram service), with the config/route/view caches warmed. Same PHP_CLI_SERVER_WORKERS as `dev`, for the same reason.",
+        "test": "Clears the config cache first, then runs PHPUnit. Always use this, never a bare `php artisan test` — a cached config can point the suite at the real MySQL database, and RefreshDatabase runs migrate:fresh."
+    },
+    "extra": {
+        "laravel": {
+            "dont-discover": []
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "preferred-install": "dist",
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true,
+            "php-http/discovery": true
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

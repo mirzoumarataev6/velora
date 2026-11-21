@@ -1,0 +1,164 @@
+<?php
+
+namespace Tests\Feature\Settings;
+
+use App\Models\Invitation;
+use App\Models\Role;
+use App\Models\TeamMembership;
+use App\Models\User;
+use App\Services\Permissions\PermissionCatalog;
+use App\Services\Teams\CreatesTeam;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Tests\TestCase;
+
+/**
+ * The separate team section only offers invitations and member controls
+ * after the owner names their personal workspace and makes it a team.
+ */
+class TeamSettingsUiTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_the_owner_sees_the_invite_form_and_role_choices(): void
+    {
+        $owner = User::factory()->create();
+        app(CreatesTeam::class)->create($owner, 'Sales');
+
+        $response = $this->actingAs($owner)->get(route('teams.index'));
+
+        $response->assertOk();
+        $response->assertSee('data-i18n="settings.team.invite_heading"', false);
+        foreach (PermissionCatalog::systemRoleSlugs() as $slug) {
+            $response->assertSee(__('shell.nav.teams.roles.'.$slug));
+        }
+    }
+
+    public function test_the_owner_sees_pending_invitations_they_sent(): void
+    {
+        $owner = User::factory()->create();
+        app(CreatesTeam::class)->create($owner, 'Sales');
+        $role = Role::where('team_id', $owner->current_team_id)->where('slug', PermissionCatalog::OPERATOR)->firstOrFail();
+        Invitation::factory()->create([
+            'team_id' => $owner->current_team_id,
+            'role_id' => $role->id,
+            'invited_by' => $owner->id,
+            'email' => 'pending@example.com',
+        ]);
+
+        $response = $this->actingAs($owner)->get(route('teams.index'));
+
+        $response->assertOk();
+        $response->assertSee('pending@example.com');
+    }
+
+    public function test_a_non_owner_sees_neither_the_invite_form_nor_pending_invitations(): void
+    {
+        $owner = User::factory()->create();
+        app(CreatesTeam::class)->create($owner, 'Sales');
+        $role = Role::where('team_id', $owner->current_team_id)->where('slug', PermissionCatalog::OPERATOR)->firstOrFail();
+        Invitation::factory()->create([
+            'team_id' => $owner->current_team_id,
+            'role_id' => $role->id,
+            'invited_by' => $owner->id,
+            'email' => 'pending@example.com',
+        ]);
+
+        $teammate = User::factory()->createQuietly();
+        TeamMembership::create([
+            'team_id' => $owner->current_team_id,
+            'user_id' => $teammate->id,
+            'role_id' => $role->id,
+            'joined_at' => now(),
+        ]);
+        $teammate->forceFill(['current_team_id' => $owner->current_team_id])->save();
+
+        $response = $this->actingAs($teammate)->get(route('teams.index'));
+
+        $response->assertOk();
+        $response->assertDontSee('data-i18n="settings.team.invite_heading"', false);
+        $response->assertDontSee('pending@example.com');
+        $response->assertSee(__('settings.team.not_owner'));
+    }
+
+    public function test_owner_sees_only_active_team_members_with_controls_for_non_owners(): void
+    {
+        $owner = User::factory()->create();
+        app(CreatesTeam::class)->create($owner, 'Sales');
+        $member = User::factory()->create(['name' => 'Visible teammate']);
+        $otherOwner = User::factory()->create();
+        $otherMember = User::factory()->create(['name' => 'Other team only']);
+        $operator = Role::where('team_id', $owner->current_team_id)->where('slug', PermissionCatalog::OPERATOR)->sole();
+        $otherOperator = Role::where('team_id', $otherOwner->current_team_id)->where('slug', PermissionCatalog::OPERATOR)->sole();
+        $membership = TeamMembership::create([
+            'team_id' => $owner->current_team_id,
+            'user_id' => $member->id,
+            'role_id' => $operator->id,
+            'joined_at' => now(),
+        ]);
+        TeamMembership::create([
+            'team_id' => $otherOwner->current_team_id,
+            'user_id' => $otherMember->id,
+            'role_id' => $otherOperator->id,
+            'joined_at' => now(),
+        ]);
+
+        $response = $this->actingAs($owner)->get(route('teams.index'));
+
+        $response->assertOk();
+        $response->assertSee('Visible teammate');
+        $response->assertDontSee('Other team only');
+        $response->assertSee(route('teams.members.update', $membership));
+        $response->assertSee(route('teams.members.destroy', $membership));
+        $response->assertDontSee(route('teams.members.destroy', $owner->membershipIn($owner->current_team_id)));
+    }
+
+    public function test_non_owner_sees_no_member_list_or_member_controls(): void
+    {
+        $owner = User::factory()->create();
+        app(CreatesTeam::class)->create($owner, 'Sales');
+        $member = User::factory()->create(['name' => 'Hidden teammate']);
+        $operator = Role::where('team_id', $owner->current_team_id)->where('slug', PermissionCatalog::OPERATOR)->sole();
+        $membership = TeamMembership::create([
+            'team_id' => $owner->current_team_id,
+            'user_id' => $member->id,
+            'role_id' => $operator->id,
+            'joined_at' => now(),
+        ]);
+        $member->forceFill(['current_team_id' => $owner->current_team_id])->save();
+
+        $response = $this->actingAs($member)->get(route('teams.index'));
+
+        $response->assertOk();
+        $response->assertDontSee('data-i18n="settings.team.members_heading"', false);
+        $response->assertDontSee(route('teams.members.destroy', $membership));
+    }
+
+    /**
+     * G-01's UI half: the Owner never sees a way to leave their own team
+     * (leave() itself would 403 them anyway — the button mirrors that
+     * rather than relying on the backend alone to say no), while an
+     * ordinary member does.
+     */
+    public function test_the_leave_button_is_hidden_for_the_owner_but_shown_for_an_ordinary_member(): void
+    {
+        $owner = User::factory()->create();
+        app(CreatesTeam::class)->create($owner, 'Sales');
+        $member = User::factory()->create();
+        $operator = Role::where('team_id', $owner->current_team_id)->where('slug', PermissionCatalog::OPERATOR)->sole();
+        TeamMembership::create([
+            'team_id' => $owner->current_team_id,
+            'user_id' => $member->id,
+            'role_id' => $operator->id,
+            'joined_at' => now(),
+        ]);
+        $member->forceFill(['current_team_id' => $owner->current_team_id])->save();
+
+        $this->actingAs($owner)->get(route('teams.index'))
+            ->assertOk()
+            ->assertDontSee(route('teams.leave'));
+
+        $this->actingAs($member)->get(route('teams.index'))
+            ->assertOk()
+            ->assertSee(route('teams.leave'));
+    }
+}

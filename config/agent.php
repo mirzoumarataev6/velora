@@ -1,0 +1,642 @@
+<?php
+
+return [
+
+    /*
+    |--------------------------------------------------------------------------
+    | LLM provider
+    |--------------------------------------------------------------------------
+    |
+    | Which implementation of LlmProviderInterface the container resolves.
+    | Supported: "openai", "gemini". Changing this changes the dimensionality
+    | of newly generated embeddings, so run `embeddings:reindex` afterwards —
+    | until you do, chunks embedded under the previous provider are skipped
+    | by the vector store (see MySqlCosineVectorStore).
+    |
+    */
+    'llm_provider' => env('LLM_PROVIDER', 'openai'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Providers a team may select in Settings → AI Provider
+    |--------------------------------------------------------------------------
+    |
+    | Kept here (not only in LlmProviderFactory::PROVIDERS) so the settings
+    | FormRequest can validate against it without reaching into a service
+    | class.
+    |
+    */
+    'llm_providers' => ['openai', 'gemini', 'ollama'],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Brand mark cache-busting version
+    |--------------------------------------------------------------------------
+    |
+    | The V mark and lockup keep their filenames when the artwork changes
+    | (mark.webp, lockup-*.webp/png), and a browser caches those far more
+    | aggressively than the page that links them. Without a query string on
+    | every <img> that renders them, a visitor who loaded the app once keeps
+    | seeing whatever version of the mark was current then, on a URL that has
+    | since started serving different pixels. favicons.blade.php learned this
+    | the hard way; this is the same fix, one number for every place the mark
+    | appears, so it cannot go stale in one spot while the rest moves on.
+    |
+    | Bump it whenever the artwork under public/images/brand/gen changes.
+    |
+    */
+    'brand_mark_version' => 4,
+
+    /*
+    |--------------------------------------------------------------------------
+    | Instagram (instagrapi) microservice
+    |--------------------------------------------------------------------------
+    |
+    | Base URL of the Python FastAPI service in instagram_service/ that drives
+    | instagrapi (an unofficial Instagram private-API client). InstagrapiDriver
+    | posts to it to log in and to send messages; it posts back to this app at
+    | POST /internal/instagram/incoming with new DMs.
+    |
+    */
+    'instagram_service' => [
+        'url' => env('INSTAGRAM_SERVICE_URL', 'http://127.0.0.1:8001'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | OpenAI API
+    |--------------------------------------------------------------------------
+    */
+    'openai' => [
+        'api_key' => env('OPENAI_API_KEY'),
+        'base_url' => env('OPENAI_BASE_URL', 'https://api.openai.com/v1'),
+        'chat_model' => env('OPENAI_CHAT_MODEL', 'gpt-4o-mini'),
+        // text-embedding-3-large, truncated to 1536 dimensions. The truncation
+        // is free (Matryoshka), so this costs exactly what -small cost in
+        // storage and in the PHP cosine loop, and measured better than -small at
+        // every length on this corpus — decisively so across languages, which is
+        // what -small could not do. A Tajik question about the teachers scored
+        // 0.099 against the chunk that answers it under -small and 0.345 under
+        // -large; Russian rose 0.372 -> 0.485. Oddly, 1536 dims also beat the
+        // full 3072 on every query tested, so there is nothing to buy by raising it.
+        //
+        // Changing this makes existing vectors incomparable WITHOUT changing
+        // their length, so `embedding_model` is recorded per chunk and the
+        // vector store skips anything embedded under a different model. Run
+        // `php artisan embeddings:reindex` after touching this.
+        'embedding_model' => env('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-large'),
+        'vision_model' => env('OPENAI_VISION_MODEL', 'gpt-4o-mini'),
+        'embedding_dimensions' => env('OPENAI_EMBEDDING_DIMENSIONS', 1536),
+        'timeout' => env('OPENAI_TIMEOUT', 30),
+        'connect_timeout' => env('OPENAI_CONNECT_TIMEOUT', 10),
+        'retry_times' => env('OPENAI_RETRY_TIMES', 3),
+        'retry_delay_ms' => env('OPENAI_RETRY_DELAY_MS', 500),
+        'embedding_batch_size' => env('OPENAI_EMBEDDING_BATCH_SIZE', 100),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Gemini API
+    |--------------------------------------------------------------------------
+    */
+    'gemini' => [
+        'api_key' => env('GEMINI_API_KEY'),
+        'base_url' => env('GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta'),
+        'chat_model' => env('GEMINI_CHAT_MODEL', 'gemini-2.5-flash'),
+        'embedding_model' => env('GEMINI_EMBEDDING_MODEL', 'gemini-embedding-001'),
+        'vision_model' => env('GEMINI_VISION_MODEL', 'gemini-2.5-flash'),
+        'embedding_dimensions' => env('GEMINI_EMBEDDING_DIMENSIONS', 768),
+        'timeout' => env('GEMINI_TIMEOUT', 30),
+        'connect_timeout' => env('GEMINI_CONNECT_TIMEOUT', 10),
+        'retry_times' => env('GEMINI_RETRY_TIMES', 3),
+        'retry_delay_ms' => env('GEMINI_RETRY_DELAY_MS', 500),
+        'embedding_batch_size' => env('GEMINI_EMBEDDING_BATCH_SIZE', 20),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Ollama (local models)
+    |--------------------------------------------------------------------------
+    |
+    | No api_key: a local/self-hosted install has nothing to authenticate with.
+    | base_url and chat_model are the two fields a team can override from
+    | Settings → AI Provider (see teams.ai_model / teams.ollama_base_url);
+    | everything else is an operator-level default.
+    |
+    */
+    'ollama' => [
+        'base_url' => env('OLLAMA_BASE_URL', 'http://localhost:11434'),
+        'chat_model' => env('OLLAMA_CHAT_MODEL', 'llama3.1'),
+        'embedding_model' => env('OLLAMA_EMBEDDING_MODEL', 'nomic-embed-text'),
+        'timeout' => env('OLLAMA_TIMEOUT', 30),
+        'connect_timeout' => env('OLLAMA_CONNECT_TIMEOUT', 5),
+        'retry_times' => env('OLLAMA_RETRY_TIMES', 1),
+        'retry_delay_ms' => env('OLLAMA_RETRY_DELAY_MS', 500),
+        'embedding_batch_size' => env('OLLAMA_EMBEDDING_BATCH_SIZE', 20),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | RAG pipeline tuning
+    |--------------------------------------------------------------------------
+    */
+    'rag' => [
+        'chunk_size_tokens' => env('RAG_CHUNK_SIZE_TOKENS', 700),
+        'chunk_overlap_tokens' => env('RAG_CHUNK_OVERLAP_TOKENS', 100),
+        'spreadsheet_rows_per_chunk' => env('RAG_SPREADSHEET_ROWS_PER_CHUNK', 20),
+        // Products per chunk for parsed XML catalogs (YML / Google Merchant /
+        // CommerceML / generic). Mirrors spreadsheet_rows_per_chunk so retrieval
+        // granularity stays consistent across tabular sources. UTF-8 files are
+        // parsed forward-only with XMLReader; a non-UTF-8 (e.g. windows-1251)
+        // source is decoded into memory first, since libxml needs a
+        // self-consistent encoding declaration to stream it.
+        'xml_products_per_chunk' => env('RAG_XML_PRODUCTS_PER_CHUNK', 20),
+        'top_k' => env('RAG_TOP_K', 8),
+        // Cosine-similarity floor for a chunk to count as a CONFIDENT match.
+        // Provider-sensitive: text-embedding-3-small (the default) clusters
+        // relevant matches around ~0.35-0.5, Gemini's gemini-embedding-001 runs
+        // higher. If you switch LLM_PROVIDER back to gemini, raise this to ~0.45.
+        //
+        // Was 0.35, which was measurably too strict: absolute cosine collapses
+        // when a short question is compared against a long chunk, and collapses
+        // further across languages. "расскажите про учителей" scored at most
+        // 0.21 against ANY chunk of a KB that plainly contained the answer, and
+        // a Tajik phrasing of the same question topped out at 0.13 — so the
+        // floor alone rejected the whole knowledge base and the agent said it
+        // had no information.
+        'similarity_threshold' => env('RAG_SIMILARITY_THRESHOLD', 0.22),
+        // A chunk must ALSO score within this fraction of the best hit to count
+        // as confident. The two bars answer different questions — the floor asks
+        // "is this on topic at all", the ratio asks "is this comparable to the
+        // best thing found" — and a chunk has to clear both, so widening one
+        // does not quietly let noise through the other.
+        'relative_ratio' => env('RAG_RELATIVE_RATIO', 0.6),
+        // When nothing clears the bars above, still hand the model this many of
+        // the best-ranked chunks, flagged as unconfirmed. A non-empty knowledge
+        // base must never present as an empty one: the model can dismiss a
+        // weak chunk, but it cannot use a chunk it was never shown.
+        'min_context_chunks' => env('RAG_MIN_CONTEXT_CHUNKS', 3),
+        // Skip embedding + vector search entirely when the message is
+        // unambiguously a price/stock/availability question AND the agent has the
+        // search_products tool, which answers those authoritatively and more
+        // currently than any uploaded document. Saves an embedding round trip
+        // plus a full cosine pass on exactly the questions the knowledge base
+        // cannot help with.
+        //
+        // The detector (App\Services\Rag\ProductQuestionDetector) is tuned for
+        // precision: any hint that the question also needs a business fact
+        // ("сколько стоит доставка?") keeps retrieval. Set to false to disable
+        // the optimization outright if a phrasing is ever misclassified — the
+        // agent then behaves exactly as it did before.
+        'skip_for_product_questions' => env('RAG_SKIP_FOR_PRODUCT_QUESTIONS', true),
+
+        // Keep about ten exchanges so a budget or rejected option survives
+        // ordinary follow-up questions without a separate summarization call.
+        'history_length' => env('RAG_HISTORY_LENGTH', 20),
+        'cache_ttl_seconds' => env('RAG_CACHE_TTL_SECONDS', 300),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Dashboard analytics
+    |--------------------------------------------------------------------------
+    |
+    | Agents carry no configured opening hours, so "outside business hours" is
+    | this default: nights, plus the whole weekend. It is named here rather than
+    | inlined in the metrics service so it is one edit away from becoming a
+    | per-agent setting, and so the definition behind the headline number on the
+    | dashboard is written down somewhere an owner's question can be answered
+    | from.
+    |
+    | The window wraps midnight: `from_hour` is inclusive, `to_hour` exclusive,
+    | so 22 and 8 mean 22:00-07:59.
+    |
+    */
+    'analytics' => [
+        // Timestamps are stored in UTC; the heatmap and the after-hours window
+        // are about the shop's wall clock, so they are read in this zone.
+        'timezone' => env('AGENT_ANALYTICS_TIMEZONE', 'Asia/Dushanbe'),
+
+        'after_hours' => [
+            'from_hour' => env('AGENT_AFTER_HOURS_FROM', 22),
+            'to_hour' => env('AGENT_AFTER_HOURS_TO', 8),
+            'weekends' => env('AGENT_AFTER_HOURS_WEEKENDS', true),
+        ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Human-like multi-message replies
+    |--------------------------------------------------------------------------
+    |
+    | A long reply is delivered the way a person types in a messenger: broken
+    | into a few consecutive messages with a typing pause between them, rather
+    | than one wall of text. Applies to every channel, always: sounding like a
+    | person is not a preference an owner benefits from switching off, and a
+    | short reply is left as a single message anyway.
+    |
+    | Splitting is by MEANING only — paragraph first, then sentence boundaries.
+    | Text with no boundary to split on is sent as one message, so these numbers
+    | are an upper bound on how many messages a reply can become, never a quota
+    | the splitter tries to fill.
+    |
+    */
+    // How often a customer is asked to rate a reply with 👍/👎. See
+    // App\Services\Quality\FeedbackCadence for the rule this feeds: a prompt
+    // is only ever shown at a natural end of conversation (a captured lead, or
+    // the customer saying thanks), and never inside this floor.
+    'feedback' => [
+        // Minimum assistant turns between one prompt and the next. Counts from
+        // a RATING, a prompt or a /start, so answering one buys the same quiet
+        // as being asked one, and a fresh session starts from zero.
+        'min_turns_between' => env('AGENT_FEEDBACK_MIN_TURNS_BETWEEN', 3),
+    ],
+
+    'humanize' => [
+        // Replies at or below this many characters are always sent as a single
+        // message (greetings, one-liners, short factual answers).
+        'min_length' => env('AGENT_HUMANIZE_MIN_LENGTH', 200),
+
+        // Hard cap on messages per reply. Keep small — this is anti-spam.
+        'max_messages' => env('AGENT_HUMANIZE_MAX_MESSAGES', 3),
+
+        // Pause before each follow-up message, scaled by how long that message
+        // is (a longer message reads as taking longer to type), then clamped
+        // into [min_delay_ms, max_delay_ms]. The typing indicator is shown for
+        // the duration of the pause on channels that support one.
+        'min_delay_ms' => env('AGENT_HUMANIZE_MIN_DELAY_MS', 800),
+        'max_delay_ms' => env('AGENT_HUMANIZE_MAX_DELAY_MS', 1500),
+        'delay_ms_per_char' => env('AGENT_HUMANIZE_DELAY_MS_PER_CHAR', 6),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Incoming voice notes (speech-to-text)
+    |--------------------------------------------------------------------------
+    |
+    | Telegram voice notes are transcribed with Whisper and then fed into the
+    | ordinary reply pipeline as if the customer had typed the transcript. The
+    | audio is never stored: it is written to a temp file, sent, and deleted.
+    |
+    | Whisper accepts OGG/Opus (what Telegram sends) directly, so no conversion
+    | is normally needed. `ffmpeg_path` is an escape hatch for environments where
+    | that is not true — set it and the file is converted to mp3 first.
+    |
+    */
+    'voice' => [
+        'model' => env('OPENAI_TRANSCRIBE_MODEL', 'whisper-1'),
+
+        // Anything longer is refused before it is downloaded. A five-minute note
+        // is already an unusual thing to send a shop, and the cost and latency
+        // of transcribing one is paid by the owner.
+        'max_duration_seconds' => env('AGENT_VOICE_MAX_DURATION', 300),
+
+        // Telegram's own getFile ceiling for bots is 20MB, below Whisper's 25MB,
+        // so that is the binding limit.
+        'max_file_bytes' => env('AGENT_VOICE_MAX_BYTES', 20 * 1024 * 1024),
+
+        // Generous next to a chat completion: Whisper is slower, and the whole
+        // thing runs inside the queued job, not the webhook request.
+        'timeout' => env('AGENT_VOICE_TIMEOUT', 60),
+
+        // Optional. Null = send the OGG straight to Whisper (the normal path).
+        'ffmpeg_path' => env('AGENT_VOICE_FFMPEG_PATH'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Escalation to a human
+    |--------------------------------------------------------------------------
+    |
+    | A conversation is flagged "needs human" when the customer is genuinely
+    | dissatisfied, asks for a person outright, or the agent had to fall back.
+    |
+    | The frustration signal is produced by the model as a tool call on the SAME
+    | generation that writes the reply, so a calm conversation costs nothing
+    | extra — there is no second classification request.
+    |
+    | Sensitivity sets the confidence the model must report before the flag is
+    | raised. The default is deliberately high: a false "angry customer" alert
+    | teaches the owner to ignore the bell, which is worse than a missed one.
+    | Per agent this is overridden by behavior.escalation.
+    |
+    */
+    'escalation' => [
+        'default_sensitivity' => env('AGENT_ESCALATION_SENSITIVITY', 'conservative'),
+
+        // Minimum model-reported confidence per sensitivity level.
+        'thresholds' => [
+            'conservative' => 0.85,
+            'balanced' => 0.70,
+            'sensitive' => 0.55,
+        ],
+
+        // An explicit "give me a human" is a stated request, not an inference,
+        // so it is honoured whatever the confidence — but still only at or above
+        // this floor, so a passing mention doesn't trip it.
+        'explicit_request_threshold' => 0.5,
+
+        // Don't re-alert on every angry message in the same conversation; the
+        // owner has already been told. Re-arms after this many minutes.
+        'renotify_after_minutes' => env('AGENT_ESCALATION_RENOTIFY_MINUTES', 180),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Knowledge source uploads
+    |--------------------------------------------------------------------------
+    */
+    'dataset' => [
+        // The structured product catalog (Каталог tab). Distinct from the
+        // knowledge base above: this is imported row-per-product into a real
+        // table and queried exactly, so only tabular formats are accepted.
+        'max_file_size_kb' => env('AGENT_DATASET_MAX_FILE_SIZE_KB', 20 * 1024),
+        'allowed_extensions' => ['xlsx', 'xls', 'csv'],
+
+        // Ceiling on imported products per agent. A file longer than this is
+        // imported up to the cap and the owner is told it was truncated —
+        // better than refusing a 60k-row export outright.
+        'max_rows' => env('AGENT_DATASET_MAX_ROWS', 50000),
+
+        // Rows shown in the mapping screen, with their values, so the owner can
+        // see what they are mapping.
+        'sample_rows' => 5,
+
+        // Page size for the owner's catalog browser in the Каталог tab. Purely
+        // a UI concern — it does not limit what the agent can find, which is
+        // ProductSearchService::MAX_LIMIT's job.
+        'preview_rows' => 10,
+
+        // How long an analyzed-but-not-yet-imported upload waits on disk for the
+        // owner to confirm its mapping before it is swept.
+        'pending_ttl_minutes' => env('AGENT_DATASET_PENDING_TTL_MINUTES', 120),
+
+        // Past this many days since the last import, the Каталог tab flags
+        // the catalog as stale — advisory only, for the owner's own
+        // dashboard. Never read by the agent or surfaced to a customer; see
+        // Dataset::isStale().
+        'stale_after_days' => env('AGENT_DATASET_STALE_AFTER_DAYS', 14),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Owner-uploaded product photos
+    |--------------------------------------------------------------------------
+    |
+    | The trusted photo source the agent's reply pipeline checks first — see
+    | ImageReplyService. Stored on the PUBLIC disk (unlike knowledge-base
+    | uploads, which stay private behind a signed route): a product photo is
+    | meant to be shown to any customer, so it needs no per-request signature,
+    | just `php artisan storage:link` once per environment.
+    */
+    'product_images' => [
+        'disk' => env('AGENT_PRODUCT_IMAGE_DISK', 'public'),
+        'max_file_size_kb' => env('AGENT_PRODUCT_IMAGE_MAX_FILE_SIZE_KB', 5 * 1024),
+        'allowed_extensions' => ['jpg', 'jpeg', 'png', 'webp'],
+        'allowed_mimes' => ['image/jpeg', 'image/png', 'image/webp'],
+        // A product rarely needs more than a couple of angles; this also
+        // bounds what ImageReplyService::MAX_IMAGES could ever draw from.
+        'max_per_product' => 6,
+        // An original wider/taller than this gets downscaled (same aspect
+        // ratio) at upload time — an owner's phone photo is routinely
+        // 3000-4000px on the long side, and the full original is what
+        // ships to a channel driver on every send. Keeps those sends
+        // light without visibly degrading what a customer sees.
+        'max_dimension_px' => env('AGENT_PRODUCT_IMAGE_MAX_DIMENSION_PX', 2000),
+        // The admin dashboard's OWN thumbnail — see ProductImageThumbnailer
+        // and ProductImage::previewUrl(). Never sent to a channel driver.
+        'thumbnail_max_dimension_px' => env('AGENT_PRODUCT_IMAGE_THUMBNAIL_MAX_DIMENSION_PX', 160),
+        'thumbnail_quality' => env('AGENT_PRODUCT_IMAGE_THUMBNAIL_QUALITY', 75),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Live database connections (advanced product source)
+    |--------------------------------------------------------------------------
+    |
+    | The alternative to uploading a catalog: the agent reads the business's own
+    | product table on every question. Everything here is a safety budget rather
+    | than a feature toggle.
+    |
+    | `allow_private_hosts` is the SSRF gate. Left off, a connection may only be
+    | pointed at a public address — otherwise an owner could dial 127.0.0.1:3306
+    | and be handed OUR database, or use the "Test connection" button to scan the
+    | internal network. Turn it on ONLY for a self-hosted install where the
+    | customer database genuinely sits on the same private network.
+    |
+    */
+    'database' => [
+        'connect_timeout_seconds' => env('AGENT_DB_CONNECT_TIMEOUT', 5),
+
+        // Server-side statement timeout. A slow customer database must not be
+        // able to hold a reply — and therefore a queue worker — open.
+        'query_timeout_seconds' => env('AGENT_DB_QUERY_TIMEOUT', 5),
+
+        // Rows shown beside each column on the mapping screen.
+        'sample_rows' => 5,
+
+        // Tables offered in the picker. A shop database with thousands of tables
+        // would otherwise put all of them in one response.
+        'max_tables' => 500,
+
+        'allow_private_hosts' => env('AGENT_DB_ALLOW_PRIVATE_HOSTS', false),
+
+        // Path to a CA bundle used to VERIFY the customer's TLS certificate.
+        // Without it the SSL toggle still encrypts, but cannot authenticate the
+        // server — see MySqlDriver::extraOptions().
+        'ssl_ca' => env('AGENT_DB_SSL_CA'),
+
+        /*
+         * Automatic schema discovery — the deterministic pass that proposes
+         * WHERE the products are, so the owner confirms rather than maps.
+         *
+         * Discovery is decided by declared facts: foreign keys, column types,
+         * and a name vocabulary read both in its own languages and through
+         * transliteration, so `nazvanie` and `narkh` need no model.
+         *
+         * `use_llm` is ON, because the case it now covers cannot be solved by
+         * any word list we could maintain: a shop whose columns are Uzbek or
+         * Tajik words the vocabulary does not carry. It is consulted only when
+         * the deterministic pass came up short — never on a scan that already
+         * has an answer — and the constraints on it are unchanged: it is given
+         * table and column NAMES only (never row data, never credentials), it
+         * returns a suggestion, and that suggestion is discarded whole if it
+         * names anything the schema does not actually contain or gives a column
+         * a type its field cannot have. It can never produce SQL, what it
+         * resolves is reported at LOW confidence with the column named, and its
+         * answer is still confirmed by the owner before anything is stored.
+         *
+         * Set AGENT_DB_DISCOVERY_USE_LLM=false to run discovery entirely on the
+         * deterministic layers.
+         */
+        'discovery' => [
+            // Tables automatic discovery will read the columns of. Above this,
+            // discovery declines and the owner is pointed at the manual picker.
+            'max_tables' => env('AGENT_DB_DISCOVERY_MAX_TABLES', 300),
+
+            // Relationship hops a composed query may follow (products →
+            // categories is one). Bounded so a join plan can never become an
+            // arbitrary walk of the customer's schema graph.
+            'max_join_depth' => 2,
+
+            // Rows in the confirmation preview the owner reviews before saving.
+            'preview_rows' => 5,
+
+            'use_llm' => env('AGENT_DB_DISCOVERY_USE_LLM', true),
+        ],
+
+        // "Test connection" attempts per minute, per user. This endpoint dials
+        // an arbitrary host:port on request, so it is rate limited whether or
+        // not private ranges are allowed.
+        'test_rate_limit' => env('AGENT_DB_TEST_RATE_LIMIT', 10),
+    ],
+
+    'uploads' => [
+        'max_file_size_kb' => env('AGENT_MAX_FILE_SIZE_KB', 20 * 1024),
+        'allowed_extensions' => ['pdf', 'docx', 'xlsx', 'csv', 'xml', 'png', 'jpg', 'jpeg', 'webp'],
+        'allowed_mimes' => [
+            'application/pdf',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'text/csv',
+            'application/xml',
+            'text/xml',
+            'image/png',
+            'image/jpeg',
+            'image/webp',
+        ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Data to Dashboard (self-service BI)
+    |--------------------------------------------------------------------------
+    |
+    | The BI module ingests a file (or reads a live connection) and answers
+    | aggregate questions about it. Everything here is a budget rather than a
+    | feature toggle: each number is a ceiling that exists so one owner's 400MB
+    | export cannot take the worker, the disk or the database down with it.
+    |
+    | Two of them are load-bearing for safety rather than capacity:
+    |
+    |  - `query.max_rows` and `query.timeout_seconds` are what stop a compiled
+    |    SELECT from being a denial of service against our own database.
+    |  - `ingest.max_columns` bounds the width of a CREATE TABLE we issue at
+    |    runtime, which is the only DDL this product ever emits.
+    |
+    */
+    'bi' => [
+
+        'ingest' => [
+            // 100MB. Streaming readers mean the ceiling is disk and queue time
+            // rather than memory — except for .xls, capped separately below,
+            // which cannot be streamed at all.
+            'max_file_size_kb' => env('BI_MAX_FILE_SIZE_KB', 100 * 1024),
+
+            // Legacy BIFF (.xls) has no streaming reader in any PHP library:
+            // PhpSpreadsheet must build the whole workbook in memory. A low cap
+            // and an honest error beats an out-of-memory fatal on the worker.
+            'max_legacy_xls_size_kb' => env('BI_MAX_LEGACY_XLS_SIZE_KB', 15 * 1024),
+
+            'allowed_extensions' => ['csv', 'tsv', 'txt', 'xlsx', 'xls', 'ods', 'json', 'ndjson', 'jsonl'],
+
+            // Rows materialized per dataset. A longer file is loaded up to the
+            // cap and the owner is told it was truncated — the same bargain the
+            // product catalog already strikes, for the same reason.
+            'max_rows' => env('BI_MAX_ROWS', 2000000),
+
+            // Columns per dataset. This is the width of a runtime CREATE TABLE,
+            // so it is a hard refusal rather than a truncation: a 400-column
+            // file is an export nobody meant to analyze, and silently dropping
+            // the tail would hide whichever column mattered.
+            'max_columns' => env('BI_MAX_COLUMNS', 150),
+
+            // Sheets read from one workbook. Each becomes its own dataset.
+            'max_sheets' => env('BI_MAX_SHEETS', 25),
+
+            // Datasets one owner may hold. Each is a physical table, so this is
+            // also the ceiling on tables one account can make us create.
+            'max_datasets_per_owner' => env('BI_MAX_DATASETS_PER_OWNER', 25),
+
+            // Rows read before types are decided. Inference is a sampled pass,
+            // not a whole-file one: a 2M-row file would otherwise be read twice.
+            // Generous enough that a column which is empty for its first few
+            // hundred rows still gets classified from real values.
+            'inference_rows' => env('BI_INFERENCE_ROWS', 5000),
+
+            // Share of non-blank values that must parse as a type before the
+            // column is given it. Below this the column becomes text, which
+            // loses nothing — a mixed column is stored verbatim rather than
+            // having its minority values thrown away.
+            'inference_threshold' => env('BI_INFERENCE_THRESHOLD', 0.95),
+
+            // Distinct values tracked per column during inference. The count is
+            // what decides whether a column is a dimension worth indexing; the
+            // exact number above this cap is not interesting, only that it is
+            // "many", so the set stops growing here.
+            'max_distinct_tracked' => env('BI_MAX_DISTINCT_TRACKED', 1001),
+
+            // A text column is a dimension (groupable, indexed) only below this
+            // many distinct values. Above it the column is free text — indexing
+            // it would cost inserts and serve no GROUP BY anyone would write.
+            'dimension_distinct_limit' => env('BI_DIMENSION_DISTINCT_LIMIT', 1000),
+
+            // Longest text value stored in an indexable VARCHAR column. Longer
+            // and the column is materialized as TEXT and never indexed, rather
+            // than being truncated: losing the tail of a description is worse
+            // than losing the ability to group by it.
+            'indexable_text_length' => 512,
+
+            // Indexes one materialized table may carry. A 150-column file can
+            // easily have 100 columns that each look worth indexing, and 100
+            // indexes would make the insert pass several times slower to serve
+            // queries nobody writes. Time columns claim this budget first, then
+            // the lowest-cardinality dimensions — see SchemaInferrer.
+            'max_indexes' => env('BI_MAX_INDEXES', 24),
+
+            // Rows per NDJSON shard, and rows per INSERT statement. The shard
+            // size bounds how much work is lost if materialization is retried;
+            // the insert size is the usual throughput-versus-packet-size trade.
+            'shard_rows' => env('BI_SHARD_ROWS', 50000),
+            'insert_chunk' => env('BI_INSERT_CHUNK', 1000),
+
+            // Uploads per account per minute. Each one stages up to 100MB and
+            // queues minutes of worker time, so this is deliberately low.
+            'upload_rate_limit' => env('BI_UPLOAD_RATE_LIMIT', 6),
+
+            // Rows kept per column as a preview, so the schema editor can show
+            // the owner what they are re-typing.
+            'sample_values' => 5,
+        ],
+
+        'query' => [
+            // Hard ceiling on rows a compiled SELECT may return, whatever the
+            // spec asked for. A chart with 5000 points is already unreadable;
+            // this exists to bound memory, not to serve a design.
+            'max_rows' => env('BI_QUERY_MAX_ROWS', 5000),
+
+            // Server-side statement timeout for our OWN analytical queries.
+            'timeout_seconds' => env('BI_QUERY_TIMEOUT', 30),
+
+            // How long a widget result is reused. A file dataset is immutable
+            // until it is re-imported, and the cache key carries the dataset
+            // version, so this can be long and needs no invalidation. A live
+            // connection gets the short TTL below instead.
+            'cache_ttl_seconds' => env('BI_QUERY_CACHE_TTL', 3600),
+            'live_cache_ttl_seconds' => env('BI_LIVE_CACHE_TTL', 60),
+
+            // Dimensions plus measures in a single spec. Not a safety limit —
+            // every field is already validated against `bi_columns` — but a
+            // bound on the shape of the GROUP BY: each added dimension
+            // multiplies the number of buckets, and a chart grouped by six
+            // things is a spreadsheet nobody can read drawn slowly.
+            'max_fields' => env('BI_QUERY_MAX_FIELDS', 24),
+
+            // Board-layout writes per minute per account. Generous: the write
+            // is a few small UPDATEs and the limiter exists to bound a runaway
+            // client, not to ration a drag. See AppServiceProvider.
+            'layout_rate_limit' => env('BI_LAYOUT_RATE_LIMIT', 60),
+        ],
+    ],
+
+];

@@ -1,0 +1,19 @@
+{
+    "name": "Velora Agents",
+    "short_name": "Velora",
+    "icons": [
+        {
+            "src": "/images/brand/gen/icon-192.png?v=4",
+            "sizes": "192x192",
+            "type": "image/png"
+        },
+        {
+            "src": "/images/brand/gen/icon-512.png?v=4",
+            "sizes": "512x512",
+            "type": "image/png"
+        }
+    ],
+    "theme_color": "#0052cc",
+    "background_color": "#f3f6fb",
+    "display": "standalone"
+}

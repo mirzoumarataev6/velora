@@ -1,0 +1,47 @@
+{{--
+    Which agent is carrying the work.
+
+    Rendered ONLY for an owner with more than one agent — DashboardMetrics
+    returns an empty array below two, and the caller drops the card entirely. A
+    comparison of one thing is not a comparison, and a single full-width bar
+    labelled with the only agent's name is the kind of chart that gets added to
+    fill a grid.
+
+    Expects: $metrics.
+--}}
+@php
+    $agents = $metrics['agent_comparison'];
+@endphp
+
+<div class="card flex h-full flex-col p-5">
+    <h2 class="section-head-title">{{ __('dashboard.agents_compare.title') }}</h2>
+    <p class="mt-1 text-xs text-muted dark:text-night-muted">{{ __('dashboard.agents_compare.description') }}</p>
+
+    <div class="mt-5 space-y-3.5">
+        @foreach ($agents as $agent)
+            <div>
+                <div class="flex items-baseline justify-between gap-3">
+                    <span class="min-w-0 truncate text-sm font-medium">{{ $agent['name'] }}</span>
+                    <span class="shrink-0 text-xs text-muted dark:text-night-muted">
+                        <span class="tnum font-medium text-ink dark:text-night-ink">{{ __('dashboard.agents_compare.messages', ['count' => $agent['messages']]) }}</span>
+                        {{-- H4: $agent['leads'] is already 0 for a role without crm.view
+                             (DashboardMetrics skips the query), but the chip itself must
+                             not print a bare "0 заявок" to someone who cannot see leads. --}}
+                        @can(\App\Services\Permissions\PermissionCatalog::CRM_VIEW)
+                            · {{ __('dashboard.agents_compare.leads', ['count' => $agent['leads']]) }}
+                        @endcan
+                        · <span class="tnum font-semibold text-brand-strong">{{ __('dashboard.agents_compare.share', ['percent' => $agent['share']]) }}</span>
+                    </span>
+                </div>
+                <div class="mt-1.5 h-2 overflow-hidden rounded-full bg-sunk dark:bg-night-raised">
+                    {{-- A share of the TOTAL across every agent, not of the
+                         busiest one — this is the load-balance question
+                         ("who's carrying how much of the whole"), so the bars
+                         across every agent read together against one 100%. --}}
+                    <div class="h-full rounded-full bg-brand transition-all duration-slow ease-out"
+                        style="width: {{ $agent['messages'] === 0 ? 0 : max(2, $agent['share']) }}%"></div>
+                </div>
+            </div>
+        @endforeach
+    </div>
+</div>
