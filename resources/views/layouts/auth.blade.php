@@ -102,7 +102,7 @@
     </a>
 
     <div class="flex items-center gap-2">
-        @include('partials.locale-switcher', ['instantSwitch' => false])
+        @include('partials.locale-switcher', ['instantSwitch' => true])
         <button id="theme-toggle" type="button" aria-label="{{ __('common.toggle_theme') }}" aria-pressed="false"
             class="flex h-9 w-9 items-center justify-center rounded-full bg-white/70 text-ink backdrop-blur-xl transition-all dark:bg-night-raised dark:text-night-ink">
             <svg class="h-4 w-4 dark:hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
@@ -333,6 +333,7 @@
         }, 4000);
     }
 </script>
+@include('partials.i18n-bundle', ['i18nNamespaces' => ['auth', 'common'], 'i18nReload' => false])
 @stack('scripts')
 </body>
 </html>

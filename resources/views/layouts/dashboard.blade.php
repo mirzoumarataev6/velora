@@ -175,6 +175,17 @@
             </a>
             @endcan
 
+            @can('analytics.view')
+            <a href="{{ route('bi.dashboards.index') }}" aria-label="{{ __('shell.nav.bi') }}" data-i18n-al="shell.nav.bi"
+                data-nav="bi"
+                @if (request()->routeIs('bi.*')) aria-current="page" @endif
+                :class="$store.shell.railCollapsed && 'lg:justify-center'"
+                class="nav-item {{ request()->routeIs('bi.*') ? 'nav-item-active' : '' }}">
+                <svg class="h-5 w-5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M4 19V5m0 14h16M8 15v-4m4 4V7m4 8v-6"/></svg>
+                <span data-i18n="shell.nav.bi" :class="$store.shell.railCollapsed && 'lg:hidden'">{{ __('shell.nav.bi') }}</span>
+            </a>
+            @endcan
+
             @can('agents.view')
             <a href="{{ route('agents.index') }}" aria-label="{{ __('shell.nav.agents') }}" data-i18n-al="shell.nav.agents"
                 data-nav="agents"
